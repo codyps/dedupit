@@ -5,7 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     os::unix::{
-        ffi::OsStringExt,
+        ffi::{OsStrExt, OsStringExt},
         fs::{symlink, FileExt, MetadataExt},
     },
     path::Path,
@@ -279,13 +279,13 @@ fn version_one_index_migrates_without_rehashing_portable_files() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
 }
 
 #[test]
 fn sparse_and_dense_files_match_without_reading_holes() {
-    let (_dir, options) = setup(Granularity::File);
+    let (_dir, options) = setup(Granularity::Both);
     let sparse = File::create(options.roots[0].join("sparse")).unwrap();
     sparse.set_len(1024 * 1024).unwrap();
     sparse.write_all_at(&[42], 512 * 1024).unwrap();
@@ -295,8 +295,51 @@ fn sparse_and_dense_files_match_without_reading_holes() {
     put(&options, "dense", &dense);
     let result = run(&options, false).unwrap();
     assert_eq!(result.duplicate_files, 1);
+    assert_eq!(result.duplicate_chunks, 1);
     assert!(result.hole_bytes_skipped > 0);
     assert!(result.bytes_hashed < 2 * 1024 * 1024);
+}
+
+#[test]
+fn old_zero_chunk_candidates_migrate_without_reading_files() {
+    let (_dir, options) = setup(Granularity::Both);
+    for length in [4096, 17, 511] {
+        put(&options, &format!("zero-{length}"), &vec![0; length]);
+    }
+    put(&options, "nonzero", &vec![42; 4096]);
+    let before = run(&options, false).unwrap();
+    let conn = rusqlite::Connection::open(&options.database).unwrap();
+    for length in [4096usize, 17, 511] {
+        let hash = blake3::hash(&vec![0; length]);
+        conn.execute(
+            "INSERT INTO ranges(file_id,kind,offset,length,hash)
+            SELECT id,0,0,?1,?2 FROM files WHERE path=?3",
+            rusqlite::params![
+                length,
+                hash.as_bytes().as_slice(),
+                options.roots[0]
+                    .join(format!("zero-{length}"))
+                    .as_os_str()
+                    .as_bytes()
+            ],
+        )
+        .unwrap();
+    }
+    conn.pragma_update(None, "user_version", 2).unwrap();
+    drop(conn);
+    let migrated = run(&options, false).unwrap();
+    assert_eq!(migrated.bytes_hashed, 0);
+    assert_eq!(migrated.duplicate_chunks, before.duplicate_chunks);
+    let conn = rusqlite::Connection::open(&options.database).unwrap();
+    let chunks: u64 = conn
+        .query_row("SELECT COUNT(*) FROM ranges WHERE kind=0", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(chunks, 1); // The nonzero chunk survives migration.
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
 }
 
 #[test]

@@ -4,17 +4,21 @@ use super::{first, setup};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     ffi::OsString,
     fs::{self, File, OpenOptions},
+    io::Read,
     os::{
         fd::AsRawFd,
         unix::{
-            ffi::OsStringExt, fs::symlink, fs::FileExt, fs::MetadataExt, process::ExitStatusExt,
+            ffi::OsStringExt, fs::symlink, fs::FileExt, fs::MetadataExt, fs::OpenOptionsExt,
+            process::ExitStatusExt,
         },
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    rc::Rc,
     thread,
     time::{Duration, Instant},
 };
@@ -56,13 +60,30 @@ impl Random {
     }
 }
 
+#[derive(Clone)]
+enum Expected {
+    Directory,
+    File(Rc<RefCell<ExpectedFile>>),
+    Symlink(PathBuf),
+}
+struct ExpectedFile {
+    identity: (u64, u64),
+    bytes: Vec<u8>,
+}
+
 struct Workload {
     inside: PathBuf,
     outside: PathBuf,
     random: Random,
     serial: u64,
+    // Independent of dedupit's hashes and of reads from the real files. Hardlink
+    // names share one model object; independent copies never share that object.
+    expected: BTreeMap<PathBuf, Expected>,
 }
 impl Workload {
+    fn controls(&self) -> PathBuf {
+        self.inside.join("sharing-controls")
+    }
     fn entries(&self, root: &Path, directory: bool) -> Vec<PathBuf> {
         let mut paths: Vec<_> = WalkDir::new(root)
             .follow_links(false)
@@ -70,6 +91,7 @@ impl Workload {
             .map(Result::unwrap)
             .filter(|e| {
                 e.path() != root
+                    && !e.path().starts_with(self.controls())
                     && if directory {
                         e.file_type().is_dir()
                     } else {
@@ -107,8 +129,174 @@ impl Workload {
     fn create(&mut self, root: &Path) {
         let path = self.destination(root);
         let size = self.random.size(64 * 1024);
-        fs::write(&path, self.random.bytes(size)).unwrap();
+        let bytes = self.random.bytes(size);
+        self.store_file(&path, bytes);
         eprintln!("  create {path:?}, size={size}");
+    }
+    fn store_file(&mut self, path: &Path, bytes: Vec<u8>) {
+        fs::write(path, &bytes).unwrap();
+        let meta = fs::symlink_metadata(path).unwrap();
+        self.expected.insert(
+            path.to_owned(),
+            Expected::File(Rc::new(RefCell::new(ExpectedFile {
+                identity: (meta.dev(), meta.ino()),
+                bytes,
+            }))),
+        );
+    }
+    fn contents(&self, path: &Path) -> Rc<RefCell<ExpectedFile>> {
+        match self.expected.get(path) {
+            Some(Expected::File(file)) => Rc::clone(file),
+            _ => panic!("file absent from content model: {path:?}"),
+        }
+    }
+    fn directory(&mut self, path: &Path) {
+        fs::create_dir(path).unwrap();
+        self.expected.insert(path.to_owned(), Expected::Directory);
+    }
+    fn rename(&mut self, source: &Path, target: &Path) {
+        fs::rename(source, target).unwrap();
+        let moved: Vec<_> = self
+            .expected
+            .keys()
+            .filter(|p| p.starts_with(source))
+            .cloned()
+            .collect();
+        assert!(
+            !moved.is_empty(),
+            "rename source missing from model: {source:?}"
+        );
+        for path in moved {
+            let entry = self.expected.remove(&path).unwrap();
+            let suffix = path.strip_prefix(source).unwrap();
+            let destination = if suffix.as_os_str().is_empty() {
+                target.to_owned()
+            } else {
+                target.join(suffix)
+            };
+            self.expected.insert(destination, entry);
+        }
+    }
+    fn forget(&mut self, path: &Path) {
+        self.expected.retain(|p, _| !p.starts_with(path));
+    }
+    fn write_at(&mut self, path: &Path, bytes: &[u8], offset: u64) {
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .write_all_at(bytes, offset)
+            .unwrap();
+        let file = self.contents(path);
+        let mut file = file.borrow_mut();
+        let end = offset as usize + bytes.len();
+        if end > file.bytes.len() {
+            file.bytes.resize(end, 0);
+        }
+        file.bytes[offset as usize..end].copy_from_slice(bytes);
+    }
+    fn verify_contents(&self, stage: &str) {
+        let mut actual: Vec<_> = [&self.inside, &self.outside]
+            .into_iter()
+            .flat_map(|root| {
+                WalkDir::new(root)
+                    .follow_links(false)
+                    .into_iter()
+                    .map(|e| e.unwrap().into_path())
+            })
+            .collect();
+        actual.sort();
+        assert_eq!(
+            actual,
+            self.expected.keys().cloned().collect::<Vec<_>>(),
+            "namespace mismatch {stage}"
+        );
+        for (path, expected) in &self.expected {
+            let meta = fs::symlink_metadata(path).unwrap();
+            match expected {
+                Expected::Directory => {
+                    assert!(meta.is_dir(), "directory changed: {path:?}, {stage}")
+                }
+                Expected::Symlink(target) => {
+                    assert!(meta.is_symlink(), "symlink changed: {path:?}, {stage}");
+                    assert_eq!(
+                        fs::read_link(path).unwrap(),
+                        *target,
+                        "symlink target changed: {path:?}, {stage}"
+                    );
+                }
+                Expected::File(file) => {
+                    let file = file.borrow();
+                    assert!(meta.is_file(), "file type changed: {path:?}, {stage}");
+                    assert_eq!(
+                        (meta.dev(), meta.ino()),
+                        file.identity,
+                        "file identity changed: {path:?}, {stage}"
+                    );
+                    // Do not generate atime changes that would disturb idle-run assertions.
+                    let mut actual = Vec::new();
+                    OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOATIME | libc::O_NOFOLLOW)
+                        .open(path)
+                        .unwrap()
+                        .read_to_end(&mut actual)
+                        .unwrap();
+                    assert_eq!(
+                        actual.len(),
+                        file.bytes.len(),
+                        "file length changed: {path:?}, {stage}"
+                    );
+                    if let Some(offset) = actual.iter().zip(&file.bytes).position(|(a, b)| a != b) {
+                        panic!("content mismatch {path:?}, offset={offset}, expected={}, actual={}, {stage}", file.bytes[offset], actual[offset]);
+                    }
+                }
+            }
+        }
+    }
+    fn prepare_sharing(&mut self, seed: u64, round: usize) {
+        let controls = self.controls();
+        if !self.expected.contains_key(&controls) {
+            self.directory(&controls);
+        }
+        let mut random = Random(seed ^ (round as u64).wrapping_mul(0xd1342543de82ef95));
+        // Incompressible, aligned controls must exercise real whole-file and
+        // partial-range sharing, regardless of the random workload's duplicates.
+        let whole: Vec<_> = (0..65536).map(|_| random.next() as u8).collect();
+        self.store_file(&controls.join("whole-a"), whole.clone());
+        self.store_file(&controls.join("whole-b"), whole);
+        let first: Vec<_> = (0..12288).map(|_| random.next() as u8).collect();
+        let mut second: Vec<_> = (0..12288).map(|_| random.next() as u8).collect();
+        second[4096..8192].copy_from_slice(&first[4096..8192]);
+        self.store_file(&controls.join("partial-a"), first);
+        self.store_file(&controls.join("partial-b"), second);
+    }
+    fn check_sharing(&self, database: &Path) {
+        let conn = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        for (kind, names) in [(1, ["whole-a", "whole-b"]), (0, ["partial-a", "partial-b"])] {
+            let paths = names.map(|name| self.controls().join(name).into_os_string().into_vec());
+            let completed: u64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM completed c JOIN ranges r ON r.id=c.target
+                 JOIN files f ON f.id=r.file_id WHERE r.kind=?1 AND f.path IN (?2,?3)",
+                    rusqlite::params![kind, paths[0], paths[1]],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                completed > 0,
+                "--apply did not complete control sharing kind={kind}"
+            );
+        }
+    }
+    fn probe_cow(&mut self, round: usize) {
+        for (name, offset) in [("whole-a", 4096), ("partial-a", 4096)] {
+            let path = self.controls().join(name);
+            let original = self.contents(&path).borrow().bytes[offset];
+            self.write_at(&path, &[original ^ 0xff, round as u8], offset as u64);
+        }
+        // The independently modeled B files must retain their original bytes.
+        self.verify_contents("after writes to shared whole-file and partial-range sources");
     }
     fn mutate(&mut self, operation: usize) {
         let root = self.inside.clone();
@@ -122,20 +310,27 @@ impl Workload {
             1 => {
                 let target = self.destination(&root);
                 fs::copy(&file, &target).unwrap();
+                let bytes = self.contents(&file).borrow().bytes.clone();
+                let meta = fs::symlink_metadata(&target).unwrap();
+                self.expected.insert(
+                    target.clone(),
+                    Expected::File(Rc::new(RefCell::new(ExpectedFile {
+                        identity: (meta.dev(), meta.ino()),
+                        bytes,
+                    }))),
+                );
                 eprintln!("  copy {file:?} -> {target:?}");
             }
             2 | 3 | 5 => {
-                let handle = OpenOptions::new().write(true).open(&file).unwrap();
-                let size = handle.metadata().unwrap().len();
+                let size = self.contents(&file).borrow().bytes.len() as u64;
                 let offset = match operation {
                     2 => self.random.below(size.max(1) as usize) as u64,
                     3 => size,
                     _ => 128 * 1024 + self.random.below(64 * 1024) as u64,
                 };
                 let length = 1 + self.random.below(8192);
-                handle
-                    .write_all_at(&self.random.bytes(length), offset)
-                    .unwrap();
+                let bytes = self.random.bytes(length);
+                self.write_at(&file, &bytes, offset);
                 eprintln!("  write op={operation} {file:?} at {offset}, len={length}");
             }
             4 => {
@@ -146,6 +341,10 @@ impl Workload {
                     .unwrap()
                     .set_len(size)
                     .unwrap();
+                self.contents(&file)
+                    .borrow_mut()
+                    .bytes
+                    .resize(size as usize, 0);
                 eprintln!("  truncate/extend {file:?}, size={size}");
             }
             6 => {
@@ -161,34 +360,44 @@ impl Workload {
                     )
                 };
                 assert_eq!(result, 0, "hole punch: {}", std::io::Error::last_os_error());
+                let model = self.contents(&file);
+                let mut model = model.borrow_mut();
+                let end = (offset as usize + 8192).min(model.bytes.len());
+                if (offset as usize) < end {
+                    model.bytes[offset as usize..end].fill(0);
+                }
                 eprintln!("  punch hole {file:?} at {offset}, len=8192");
             }
             7 | 9 => {
                 let target = self.destination(&root);
                 if operation == 7 {
-                    fs::rename(&file, &target).unwrap();
+                    self.rename(&file, &target);
                 } else {
                     fs::hard_link(&file, &target).unwrap();
+                    self.expected
+                        .insert(target.clone(), Expected::File(self.contents(&file)));
                 }
                 eprintln!("  rename/link op={operation} {file:?} -> {target:?}");
             }
             8 => {
                 fs::remove_file(&file).unwrap();
+                self.forget(&file);
                 eprintln!("  unlink {file:?}");
             }
             10 | 11 => {
                 if let Some(directory) = self.choose(&root, true) {
                     if operation == 10 {
                         let target = self.name(&root);
-                        fs::rename(&directory, &target).unwrap();
+                        self.rename(&directory, &target);
                         eprintln!("  rename directory {directory:?} -> {target:?}");
                     } else {
                         fs::remove_dir_all(&directory).unwrap();
+                        self.forget(&directory);
                         eprintln!("  remove directory tree {directory:?}");
                     }
                 } else {
                     let directory = self.name(&root);
-                    fs::create_dir(&directory).unwrap();
+                    self.directory(&directory);
                     self.create(&directory);
                     eprintln!("  create populated directory {directory:?}");
                 }
@@ -204,7 +413,7 @@ impl Workload {
                     .or_else(|| self.choose(&from, false))
                 {
                     let target = self.destination(&to);
-                    fs::rename(&source, &target).unwrap();
+                    self.rename(&source, &target);
                     eprintln!("  move across scope {source:?} -> {target:?}");
                 } else {
                     self.create(&from);
@@ -213,19 +422,22 @@ impl Workload {
             13 => {
                 let temporary = self.name(&outside);
                 let size = self.random.size(64 * 1024);
-                fs::write(&temporary, self.random.bytes(size)).unwrap();
-                fs::rename(&temporary, &file).unwrap();
+                let bytes = self.random.bytes(size);
+                self.store_file(&temporary, bytes);
+                self.rename(&temporary, &file);
                 eprintln!("  atomic replacement {file:?}, size={size}");
             }
             14 => {
                 let directory = self.destination(&root);
-                fs::create_dir(&directory).unwrap();
+                self.directory(&directory);
                 self.create(&directory);
                 eprintln!("  create populated directory {directory:?}");
             }
             15 => {
                 let target = self.destination(&root);
                 symlink(&file, &target).unwrap();
+                self.expected
+                    .insert(target.clone(), Expected::Symlink(file.clone()));
                 eprintln!("  symlink {target:?} -> {file:?}");
             }
             _ => unreachable!(),
@@ -233,7 +445,7 @@ impl Workload {
     }
 }
 
-fn command(database: &Path, root: &Path, portable: bool) -> Command {
+fn command(database: &Path, root: &Path, portable: bool, apply: bool) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_dedupit"));
     cmd.arg("--database")
         .arg(database)
@@ -242,11 +454,14 @@ fn command(database: &Path, root: &Path, portable: bool) -> Command {
     if portable {
         cmd.arg("--verify");
     }
+    if apply {
+        cmd.arg("--apply");
+    }
     cmd.arg(root);
     cmd
 }
-fn run(database: &Path, root: &Path, portable: bool) -> Value {
-    let output = command(database, root, portable).output().unwrap();
+fn run(database: &Path, root: &Path, portable: bool, apply: bool) -> Value {
+    let output = command(database, root, portable, apply).output().unwrap();
     assert!(
         output.status.success(),
         "dedupit {:?}: {}\n{}",
@@ -263,9 +478,17 @@ fn run(database: &Path, root: &Path, portable: bool) -> Value {
     stats
 }
 
-fn interrupt(database: &Path, root: &Path, log: &Path) -> bool {
+fn interrupt(database: &Path, root: &Path, log: &Path, apply: bool) -> bool {
+    let completed_before = if apply {
+        Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM completed", [], |r| r.get::<_, u64>(0))
+            .unwrap()
+    } else {
+        0
+    };
     let output = File::create(log).unwrap();
-    let mut child = command(database, root, false)
+    let mut child = command(database, root, false, apply)
         .stdout(Stdio::from(output.try_clone().unwrap()))
         .stderr(Stdio::from(output))
         .spawn()
@@ -281,12 +504,16 @@ fn interrupt(database: &Path, root: &Path, log: &Path) -> bool {
             eprintln!("  scan completed before interruption");
             return false;
         }
-        let queued = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        let (progress, pending) = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .and_then(|conn| {
-                conn.query_row("SELECT COUNT(*) FROM discovery", [], |r| r.get::<_, u64>(0))
+                conn.query_row(if apply {
+                    "SELECT (SELECT COUNT(*) FROM completed), (SELECT COUNT(*) FROM ranges WHERE pending=1)"
+                } else {
+                    "SELECT 0, COUNT(*) FROM discovery"
+                }, [], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, u64>(1)?)))
             })
-            .unwrap_or(0);
-        if queued > 0 {
+            .unwrap_or((0, 0));
+        if pending > 0 && (!apply || progress > completed_before) {
             child.kill().unwrap();
             let status = child.wait().unwrap();
             if status.success() {
@@ -299,7 +526,11 @@ fn interrupt(database: &Path, root: &Path, log: &Path) -> bool {
                 "child failed before interruption: {}",
                 fs::read_to_string(log).unwrap()
             );
-            eprintln!("  killed process with {queued} durable discovery jobs; restarting");
+            if apply {
+                eprintln!("  killed --apply after {} completed jobs, with {pending} pending ranges; restarting", progress - completed_before);
+            } else {
+                eprintln!("  killed process with {pending} durable discovery jobs; restarting");
+            }
             return true;
         }
         if Instant::now() >= deadline {
@@ -377,6 +608,50 @@ fn inventory(database: &Path, root: &Path) -> BTreeMap<(u64, u64), IndexedFile> 
 }
 
 #[test]
+fn independent_content_oracle_tracks_aliases_and_rejects_matching_corruption() {
+    let (dir, options) = setup();
+    let outside = dir.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let mut workload = Workload {
+        inside: options.roots[0].clone(),
+        outside: outside.clone(),
+        random: Random(1),
+        serial: 0,
+        expected: BTreeMap::from([
+            (options.roots[0].clone(), Expected::Directory),
+            (outside.clone(), Expected::Directory),
+        ]),
+    };
+    let a = options.roots[0].join("a");
+    let b = options.roots[0].join("b");
+    let alias = outside.join("alias");
+    workload.store_file(&a, vec![42; 8]);
+    workload.store_file(&b, vec![42; 8]);
+    fs::hard_link(&a, &alias).unwrap();
+    workload
+        .expected
+        .insert(alias, Expected::File(workload.contents(&a)));
+    workload.write_at(&a, &[99], 2);
+    workload.verify_contents("hardlink changes propagate; independent copy retains its bytes");
+    let replacement = outside.join("replacement");
+    workload.store_file(&replacement, vec![7; 8]);
+    workload.rename(&replacement, &a);
+    workload.verify_contents("atomic replacement leaves old hardlink aliases intact");
+    // A fresh scan would faithfully hash these corrupted bytes. The independent
+    // content model must reject them even when both files become identical.
+    fs::write(&a, [0; 8]).unwrap();
+    fs::write(&b, [0; 8]).unwrap();
+    let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        workload.verify_contents("deliberate matching corruption");
+    }))
+    .unwrap_err();
+    assert!(error
+        .downcast_ref::<String>()
+        .unwrap()
+        .contains("content mismatch"));
+}
+
+#[test]
 fn random_changes_and_process_restarts_match_fresh_full_scan() {
     let seeds = if let Ok(value) = std::env::var("DEDUPIT_STRESS_SEED") {
         vec![value
@@ -402,17 +677,30 @@ fn random_changes_and_process_restarts_match_fresh_full_scan() {
             outside,
             random: Random(seed),
             serial: 0,
+            expected: BTreeMap::from([
+                (options.roots[0].clone(), Expected::Directory),
+                (dir.path().join("outside"), Expected::Directory),
+            ]),
         };
         for _ in 0..12 {
             workload.create(&options.roots[0]);
         }
         let nested = workload.outside.join("old/child");
-        fs::create_dir_all(&nested).unwrap();
+        workload.directory(&workload.outside.join("old"));
+        workload.directory(&nested);
         workload.create(&nested);
-        run(&options.database, &options.roots[0], false);
+        workload.prepare_sharing(seed, 0);
+        workload.verify_contents("before initial --apply");
+        let initial = run(&options.database, &options.roots[0], false, true);
+        assert!(initial["jobs_completed"].as_u64().unwrap() > 0);
+        assert!(initial["bytes_deduped"].as_u64().unwrap() > 0);
+        workload.check_sharing(&options.database);
+        workload.verify_contents("after initial --apply");
         let mut interruptions = 0;
+        let mut apply_interruptions = 0;
         for round in 0..rounds {
             eprintln!("STRESS seed={seed}, round={round}");
+            workload.prepare_sharing(seed, round + 1);
             let mut operations: Vec<_> = (0..16).collect();
             for i in (1..operations.len()).rev() {
                 let other = workload.random.below(i + 1);
@@ -421,25 +709,49 @@ fn random_changes_and_process_restarts_match_fresh_full_scan() {
             for operation in operations {
                 workload.mutate(operation);
             }
+            workload.verify_contents("after random writes and filesystem mutations");
             if round % 4 == 2 {
                 let interrupted = interrupt(
                     &options.database,
                     &options.roots[0],
                     &dir.path().join("interrupted.log"),
+                    false,
                 );
                 interruptions += usize::from(interrupted);
                 if interrupted {
+                    workload.verify_contents("after interrupted discovery");
                     eprintln!("  mutating while dedupit is stopped");
                     workload.mutate(2);
                     workload.mutate(0);
                 }
             }
-            let incremental = run(&options.database, &options.roots[0], false);
+            run(&options.database, &options.roots[0], false, false);
+            if round % 4 == 0 {
+                let interrupted = interrupt(
+                    &options.database,
+                    &options.roots[0],
+                    &dir.path().join("interrupted-apply.log"),
+                    true,
+                );
+                apply_interruptions += usize::from(interrupted);
+                if interrupted {
+                    workload.verify_contents("after interrupted --apply");
+                    eprintln!("  mutating while --apply is stopped");
+                    workload.mutate(2);
+                    workload.mutate(0);
+                }
+            }
+            workload.verify_contents("before resumed --apply");
+            run(&options.database, &options.roots[0], false, true);
+            workload.check_sharing(&options.database);
+            workload.verify_contents("after --apply and restart");
+            workload.probe_cow(round);
+            let incremental = run(&options.database, &options.roots[0], false, false);
             // A different empty database each round is an independent oracle;
             // --verify and --scanner portable prohibit metadata/hash reuse.
             let oracle_dir = tempfile::tempdir_in(dir.path()).unwrap();
             let fresh = oracle_dir.path().join("full.sqlite");
-            let full = run(&fresh, &options.roots[0], true);
+            let full = run(&fresh, &options.roots[0], true, false);
             let actual = inventory(&options.database, &options.roots[0]);
             let expected = inventory(&fresh, &options.roots[0]);
             assert_eq!(
@@ -464,9 +776,10 @@ fn random_changes_and_process_restarts_match_fresh_full_scan() {
                     "seed={seed}, round={round}, field={field}"
                 );
             }
-            let idle = run(&options.database, &options.roots[0], false);
+            let idle = run(&options.database, &options.roots[0], false, true);
             assert_eq!(idle["bytes_hashed"], 0, "seed={seed}, round={round}");
             assert_eq!(idle["files_seen"], 0, "seed={seed}, round={round}");
+            workload.verify_contents("after idle --apply restart");
             eprintln!("STRESS verified seed={seed}, round={round}");
         }
         if rounds >= 4 {
@@ -474,7 +787,11 @@ fn random_changes_and_process_restarts_match_fresh_full_scan() {
                 interruptions > 0,
                 "no queued scan was interrupted for seed={seed}"
             );
+            assert!(
+                apply_interruptions > 0,
+                "no active --apply was interrupted for seed={seed}"
+            );
         }
-        eprintln!("STRESS complete seed={seed}, interruptions={interruptions}");
+        eprintln!("STRESS complete seed={seed}, interruptions={interruptions}, apply_interruptions={apply_interruptions}, contents verified");
     }
 }

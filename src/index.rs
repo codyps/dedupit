@@ -92,7 +92,7 @@ impl Index {
         )?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            (0..=2).contains(&version),
+            (0..=3).contains(&version),
             "unsupported index schema version {version}"
         );
         conn.execute_batch(
@@ -193,6 +193,35 @@ impl Index {
             );
         } else {
             conn.execute("INSERT INTO config VALUES ('scan', ?1)", [&config])?;
+        }
+        if version < 3 {
+            let tx = conn.unchecked_transaction()?;
+            let lengths = tx
+                .prepare("SELECT DISTINCT length FROM ranges WHERE kind=0 ORDER BY length")?
+                .query_map([], |r| r.get::<_, usize>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // Migrate cached v1/v2 ranges without reading files. Incrementally
+            // hash prefixes of one zero buffer, so even many distinct EOF tail
+            // lengths require hashing at most one chunk's worth of zero bytes.
+            let maximum = lengths.last().copied().unwrap_or(0);
+            ensure!(
+                maximum <= options.chunk_size && maximum <= 16 * 1024 * 1024,
+                "invalid cached chunk length"
+            );
+            let zeros = vec![0; maximum];
+            let mut hasher = blake3::Hasher::new();
+            let mut previous = 0;
+            for length in lengths {
+                hasher.update(&zeros[previous..length]);
+                let hash = hasher.finalize();
+                tx.execute(
+                    "DELETE FROM ranges WHERE kind=0 AND length=?1 AND hash=?2",
+                    params![length, hash.as_bytes().as_slice()],
+                )?;
+                previous = length;
+            }
+            tx.pragma_update(None, "user_version", 3)?;
+            tx.commit()?;
         }
         Ok(Self {
             conn,

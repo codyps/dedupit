@@ -66,7 +66,8 @@ It also reconsiders successful work; physical layout changes made by external
 tools may not always change the metadata used by the cache. Verification always
 performs a portable full reconciliation and resets the native crawl baseline.
 Switching from portable discovery to btrfs discovery likewise establishes a new
-baseline. Existing version-1 indexes upgrade transactionally to version 2.
+baseline. Existing version-1/2 indexes upgrade transactionally to version 3
+without rereading files; legacy zero-filled chunk candidates are removed.
 
 Exit code 0 means the run finished without operational errors. Exit code 2
 means per-file errors occurred; other files were still processed. Fatal errors
@@ -135,6 +136,8 @@ The portable fallback works as follows:
   fallback. Whole-file fingerprints combine size and the ordered positions,
   lengths, and BLAKE3 hashes of nonzero chunks. Holes and allocated zeroes have
   the same whole-file fingerprint; hashing does not require reading huge holes.
+  All-zero chunks are omitted from chunk candidates as well, so sharing a hole
+  with allocated zero data cannot change duplicate reports without changing bytes.
 * Indexed fingerprint lookups select a representative for each duplicate group,
   rather than comparing every pair. Pending jobs and successful source/target
   relationships persist across runs. Report-only runs preserve pending work for
@@ -272,6 +275,19 @@ sizes around chunk boundaries. Each scan
 starts a new CLI process. Every fourth round attempts to kill a process after
 observing committed discovery jobs, makes additional changes while dedupit is
 stopped, then resumes from the same database; each seed must exercise an interruption.
+Every round also runs `--apply`. Controlled incompressible files require both
+whole-file and partial-range jobs to complete, followed by writes to the shared
+sources to verify independent copy-on-write behavior. On another four-round
+cycle the test kills an apply process after observing new completed jobs while
+pending work remains, modifies files during downtime, and resumes `--apply`;
+each seed must exercise an apply interruption too.
+
+An independent in-memory model records expected bytes, file identities,
+hardlink aliases, copies, sparse extension, hole punching, renames, deletions,
+and symlink targets. The test reads every modeled file inside and outside the
+scan scope and compares its actual bytes with this model after mutations,
+apply runs, interruptions, and restarts. This catches corruption even if an
+incremental scan and a fresh scan would agree on the same corrupted contents.
 
 After every mutation batch, the test compares the incremental index against a
 new empty database scanned with `--scanner portable --verify`. It checks the
@@ -279,7 +295,8 @@ complete file inventory by device/inode (hardlinks may choose different path
 representatives), validates that indexed paths still resolve to those files,
 compares fingerprints and every whole-file/chunk range hash, checks duplicate
 counts/bytes and SQLite integrity, and requires an idle restart to read no data
-and visit no old files. This tests process interruption, not guest power loss.
+and visit no old files, including on an idle `--apply` restart. This tests process
+interruption, not guest power loss.
 
 To run the privileged tests without granting the host additional capabilities,
 use the QEMU runner. It boots an x86_64 Linux kernel with a small initramfs,

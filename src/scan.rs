@@ -393,7 +393,10 @@ pub(crate) fn index_file(
                 hash.as_bytes().as_slice(),
                 nonzero
             ])?;
-            if options.granularity != Granularity::File {
+            // Holes and allocated zeroes are the same logical data. Dedupe can
+            // change their physical representation without changing timestamps;
+            // omit both from chunk candidates, just as whole-file hashes do.
+            if nonzero && options.granularity != Granularity::File {
                 insert.execute(params![
                     file_id,
                     0,
