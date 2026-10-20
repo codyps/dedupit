@@ -263,6 +263,24 @@ filesystem and required privileged discovery tests in a separate QEMU job,
 including snapshot discovery and agreement with a fresh full rehash. The QEMU
 job uploads its serial log even on failure.
 
+The QEMU suite includes a seeded differential stress test: three fixed seeds,
+16 rounds per seed, and 16 shuffled mutation types per round (at least 768
+operations). It covers copies, writes, appends, truncation/extension, sparse writes,
+hole punching, hardlinks, symlinks, file/directory renames and deletions, moves
+across the scan boundary, atomic replacement, non-UTF-8 names, empty files and
+sizes around chunk boundaries. Each scan
+starts a new CLI process. Every fourth round attempts to kill a process after
+observing committed discovery jobs, makes additional changes while dedupit is
+stopped, then resumes from the same database; each seed must exercise an interruption.
+
+After every mutation batch, the test compares the incremental index against a
+new empty database scanned with `--scanner portable --verify`. It checks the
+complete file inventory by device/inode (hardlinks may choose different path
+representatives), validates that indexed paths still resolve to those files,
+compares fingerprints and every whole-file/chunk range hash, checks duplicate
+counts/bytes and SQLite integrity, and requires an idle restart to read no data
+and visit no old files. This tests process interruption, not guest power loss.
+
 To run the privileged tests without granting the host additional capabilities,
 use the QEMU runner. It boots an x86_64 Linux kernel with a small initramfs,
 checks that the guest has `CAP_SYS_ADMIN`, and runs all discovery tests with
@@ -288,7 +306,10 @@ libraries in the guest, preserving their paths (including Nix store paths).
 `--cargo` and `--qemu` select executables outside `PATH`. Serial output is saved
 to `target/btrfs-qemu.log`; the timeout defaults to 600 seconds. The temporary
 disk and initramfs are removed after the run. This runner was exercised with
-QEMU 11.1.1 and Linux 6.18.55: **5 passed, 0 failed, no skips**.
+QEMU 11.1.1 and Linux 6.18.55. To replay a failing stress seed or increase the
+workload, add `--stress-seed DECIMAL_U64 --stress-rounds N` (1 through 256).
+Seed, round, mutations, and interruptions are recorded in the serial log.
+Direct Cargo runs accept `DEDUPIT_STRESS_SEED` and `DEDUPIT_STRESS_ROUNDS`.
 
 Kernel interfaces: [FIDEDUPERANGE](https://man7.org/linux/man-pages/man2/ioctl_fideduperange.2.html),
 [btrfs deduplication](https://btrfs.readthedocs.io/en/latest/Deduplication.html),

@@ -6,6 +6,9 @@ use std::{
     path::Path,
 };
 
+#[path = "support/btrfs_stress.rs"]
+mod stress;
+
 fn setup() -> (tempfile::TempDir, Options) {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
@@ -210,4 +213,25 @@ fn native_discovery_hardlink_outside_scope_does_not_keep_deleted_input() {
         .unwrap();
     assert_eq!(count, 0);
     assert!(dir.path().join("outside-link").exists());
+}
+
+#[test]
+fn native_discovery_moved_in_old_subtree_tracks_later_nested_deletion() {
+    let (dir, options) = setup();
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(outside.join("child/grandchild")).unwrap();
+    fs::write(outside.join("child/grandchild/a"), data(32768)).unwrap();
+    if first(&options).is_none() {
+        return;
+    }
+    let inside = options.roots[0].join("moved");
+    fs::rename(&outside, &inside).unwrap();
+    assert_eq!(scan(&options).files_hashed, 1);
+    fs::remove_dir_all(inside.join("child")).unwrap();
+    assert_eq!(scan(&options).files_removed, 1);
+    let count: u64 = rusqlite::Connection::open(&options.database)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
 }

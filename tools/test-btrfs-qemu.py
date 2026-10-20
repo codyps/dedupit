@@ -28,6 +28,8 @@ def copy_binary(binary, root, destination=None):
     for dependency in set(re.findall(r"(/[^\s()]+)", result.stdout)):
         source = Path(dependency)
         target = root / dependency.lstrip("/")
+        if target.exists():
+            continue
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
 
@@ -110,7 +112,14 @@ def main():
     parser.add_argument("--cargo", default="cargo")
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--log", type=Path, default=Path("target/btrfs-qemu.log"))
+    parser.add_argument("--stress-seed", type=int, help="replay one stress seed (decimal u64)")
+    parser.add_argument("--stress-rounds", type=int, default=16,
+                        help="mutation/scan rounds per stress seed (1..256)")
     args = parser.parse_args()
+    if not 1 <= args.stress_rounds <= 256:
+        parser.error("--stress-rounds must be between 1 and 256")
+    if args.stress_seed is not None and not 0 <= args.stress_seed < 2**64:
+        parser.error("--stress-seed must fit a u64")
     applets = subprocess.check_output([args.busybox, "--list"], text=True).splitlines()
     for required in ["mount", "umount", "insmod", "poweroff", "sh", "grep", "sed"]:
         if required not in applets:
@@ -136,8 +145,18 @@ def main():
         copy_binary(args.busybox, root, "/bin/busybox")
         (root / "bin/sh").symlink_to("busybox")
         copy_binary(executables[0], root, "/discovery-tests")
+        # Integration tests spawn the actual CLI at Cargo's compiled-in path.
+        binaries = [a["executable"] for a in artifacts if a.get("executable")
+                    and a.get("target", {}).get("kind") == ["bin"]
+                    and a["target"]["name"] == "dedupit" and not a["profile"]["test"]]
+        if len(binaries) != 1:
+            raise RuntimeError(f"expected one dedupit CLI executable: {binaries}")
+        copy_binary(binaries[0], root)
         module_commands = modules_for(args.modules, ["virtio_pci", "virtio_blk", "btrfs"], root)
         init = root / "init"
+        stress_environment = f"export DEDUPIT_STRESS_ROUNDS={args.stress_rounds}\n"
+        if args.stress_seed is not None:
+            stress_environment += f"export DEDUPIT_STRESS_SEED={args.stress_seed}\n"
         init.write_text("""#!/bin/sh
 export PATH=/bin
 /bin/busybox --install -s /bin
@@ -163,7 +182,7 @@ for attempt in $(seq 1 30); do
 done
 mount -t btrfs -o compress=zstd /dev/vda /test
 export TMPDIR=/test DEDUPIT_REQUIRE_BTRFS_SCANNER=1 RUST_BACKTRACE=1
-/discovery-tests --nocapture --test-threads=1
+""" + stress_environment + """/discovery-tests --nocapture --test-threads=1
 umount /test
 trap - EXIT
 finish 0

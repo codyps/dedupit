@@ -473,13 +473,43 @@ fn directory_job(
         }
         if !initial && old.as_ref().is_none_or(|old| !in_scope(old, &index.roots)) {
             if let Some(path) = path.as_ref().filter(|path| in_scope(path, &index.roots)) {
+                let device = fs::symlink_metadata(path)?.dev();
                 for entry in WalkDir::new(path)
                     .follow_links(false)
                     .same_file_system(true)
                 {
                     let entry = entry?;
+                    if !entry.file_type().is_file() && !entry.file_type().is_dir() {
+                        continue;
+                    }
+                    let metadata = entry.metadata()?;
+                    // WalkDir yields subvolume boundary entries even when it
+                    // does not descend. Their inode numbers belong to another
+                    // tree and must be handled by that subvolume's crawl.
+                    if metadata.dev() != device {
+                        continue;
+                    }
                     if entry.file_type().is_file() {
-                        queue(index, crawl.id, entry.metadata()?.ino(), false)?;
+                        queue(index, crawl.id, metadata.ino(), false)?;
+                    } else if entry.file_type().is_dir() && entry.path() != path {
+                        let child = metadata.ino();
+                        // Old descendant directories may never appear in this
+                        // generation window. Remember their locations so later
+                        // deletion can queue every formerly indexed descendant.
+                        // The ancestor walk has already enumerated this tree;
+                        // seeding unknown locations avoids walking it again for
+                        // each child job. Preserve known locations as rename
+                        // evidence and queue validation of every child.
+                        index.conn.execute(
+                            "INSERT OR IGNORE INTO btrfs_dirs VALUES (?1,?2,?3,?4)",
+                            params![
+                                crawl.id,
+                                child,
+                                path_bytes(entry.path()),
+                                path_bytes(entry.path().parent().unwrap())
+                            ],
+                        )?;
+                        queue(index, crawl.id, child, true)?;
                     }
                 }
             }
@@ -1013,6 +1043,47 @@ mod tests {
         let moved = cycle(&options, &mut source).unwrap();
         assert!(moved.errors.is_empty(), "{moved:?}");
         assert_eq!(moved.bytes_hashed, 12288);
+    }
+
+    #[test]
+    fn moved_in_old_directories_track_later_deleted_descendants() {
+        let (dir, options, mut source, ino) = setup(Granularity::Both);
+        source.base = dir.path().to_owned();
+        fs::create_dir_all(dir.path().join("outside/child/grandchild")).unwrap();
+        fs::rename(
+            options.roots[0].join("f"),
+            dir.path().join("outside/child/grandchild/f"),
+        )
+        .unwrap();
+        for node in source.nodes.values_mut() {
+            node.path = Path::new("data").join(&node.path);
+        }
+        source.nodes.get_mut(&ino).unwrap().path = "outside/child/grandchild/f".into();
+        source.add("", vec![]);
+        let outside = source.add("outside", vec![]);
+        let child = source.add("outside/child", vec![]);
+        let grandchild = source.add("outside/child/grandchild", vec![]);
+        assert_eq!(cycle(&options, &mut source).unwrap().files_seen, 0);
+        fs::rename(dir.path().join("outside"), options.roots[0].join("inside")).unwrap();
+        source.high = 2;
+        for id in [outside, child, grandchild, ino] {
+            let node = source.nodes.get_mut(&id).unwrap();
+            node.path = Path::new("data/inside").join(node.path.strip_prefix("outside").unwrap());
+        }
+        source.nodes.get_mut(&outside).unwrap().path = "data/inside".into();
+        source.nodes.get_mut(&outside).unwrap().transid = 2;
+        let moved = cycle(&options, &mut source).unwrap();
+        assert!(moved.errors.is_empty(), "{moved:?}");
+        assert_eq!(moved.bytes_hashed, 12288);
+        fs::remove_dir_all(options.roots[0].join("inside/child")).unwrap();
+        source.high = 3;
+        source.nodes.get_mut(&outside).unwrap().transid = 3;
+        for id in [child, grandchild, ino] {
+            source.nodes.remove(&id);
+        }
+        let removed = cycle(&options, &mut source).unwrap();
+        assert!(removed.errors.is_empty(), "{removed:?}");
+        assert_eq!(removed.files_removed, 1);
     }
 
     #[test]
