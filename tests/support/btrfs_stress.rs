@@ -479,10 +479,16 @@ fn run(database: &Path, root: &Path, portable: bool, apply: bool) -> Value {
 }
 
 fn interrupt(database: &Path, root: &Path, log: &Path, apply: bool) -> bool {
+    let observer = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    observer.busy_timeout(Duration::from_millis(50)).unwrap();
+    // A rescan can remove old completion rows, so their count is not monotonic.
+    // Fresh sharing controls guarantee new AUTOINCREMENT range IDs each round;
+    // a newly completed ID therefore identifies durable apply progress.
     let completed_before = if apply {
-        Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM completed", [], |r| r.get::<_, u64>(0))
+        observer
+            .query_row("SELECT COALESCE(MAX(target),0) FROM completed", [], |r| {
+                r.get::<_, u64>(0)
+            })
             .unwrap()
     } else {
         0
@@ -493,7 +499,10 @@ fn interrupt(database: &Path, root: &Path, log: &Path, apply: bool) -> bool {
         .stderr(Stdio::from(output))
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Emulated apply/fsync can take much longer than a scan. Short bounded read
+    // waits and a persistent observer avoid reopening SQLite on every poll.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last_error = String::new();
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             assert!(
@@ -504,15 +513,21 @@ fn interrupt(database: &Path, root: &Path, log: &Path, apply: bool) -> bool {
             eprintln!("  scan completed before interruption");
             return false;
         }
-        let (progress, pending) = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .and_then(|conn| {
-                conn.query_row(if apply {
-                    "SELECT (SELECT COUNT(*) FROM completed), (SELECT COUNT(*) FROM ranges WHERE pending=1)"
+        let observation = observer.query_row(if apply {
+                    "SELECT (SELECT COALESCE(MAX(target),0) FROM completed), (SELECT COUNT(*) FROM ranges WHERE pending=1)"
                 } else {
                     "SELECT 0, COUNT(*) FROM discovery"
-                }, [], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, u64>(1)?)))
-            })
-            .unwrap_or((0, 0));
+                }, [], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, u64>(1)?)));
+        let (progress, pending) = match observation {
+            Ok(observation) => {
+                last_error.clear();
+                observation
+            }
+            Err(error) => {
+                last_error = error.to_string();
+                (0, 0)
+            }
+        };
         if pending > 0 && (!apply || progress > completed_before) {
             child.kill().unwrap();
             let status = child.wait().unwrap();
@@ -527,18 +542,31 @@ fn interrupt(database: &Path, root: &Path, log: &Path, apply: bool) -> bool {
                 fs::read_to_string(log).unwrap()
             );
             if apply {
-                eprintln!("  killed --apply after {} completed jobs, with {pending} pending ranges; restarting", progress - completed_before);
+                eprintln!("  killed --apply after new completed target={progress}, with {pending} pending ranges; restarting");
             } else {
                 eprintln!("  killed process with {pending} durable discovery jobs; restarting");
             }
             return true;
         }
         if Instant::now() >= deadline {
+            // The child may have exited while the last observation was waiting
+            // for SQLite. A missed interruption window is not a stalled child.
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "child exited {status}: {}",
+                    fs::read_to_string(log).unwrap()
+                );
+                eprintln!("  scan completed before interruption deadline");
+                return false;
+            }
+            let wait =
+                fs::read_to_string(format!("/proc/{}/wchan", child.id())).unwrap_or_default();
             child.kill().unwrap();
             child.wait().unwrap();
-            panic!("scan did not make progress before interruption deadline");
+            panic!("interruption deadline: apply={apply}, prior_target={completed_before}, current_target={progress}, pending={pending}, sqlite={last_error:?}, wait={wait:?}, child_log={}", fs::read_to_string(log).unwrap());
         }
-        thread::sleep(Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
