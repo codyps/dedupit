@@ -1,0 +1,69 @@
+name: Rust
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - name: Test QEMU result validation
+        run: python3 -m unittest discover -s tools -p 'test_*.py'
+
+  btrfs-qemu:
+    name: Privileged btrfs discovery (QEMU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install guest kernel and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 busybox-static btrfs-progs cpio zstd linux-image-generic
+      - name: Run required privileged discovery tests in QEMU
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Boot the installed generic kernel, independently of the host kernel.
+          kernel_image="$(find /boot -maxdepth 1 -name 'vmlinuz-*-generic' -printf '%f\n' | sort -V | tail -n 1)"
+          test -n "$kernel_image"
+          kernel_version="${kernel_image#vmlinuz-}"
+          test -f "/lib/modules/$kernel_version/modules.dep"
+          # Ubuntu kernel images can be root-readable only. QEMU runs unprivileged.
+          sudo install -m 0644 "/boot/$kernel_image" "$RUNNER_TEMP/btrfs-test-kernel"
+          python3 tools/test-btrfs-qemu.py \
+            --kernel "$RUNNER_TEMP/btrfs-test-kernel" \
+            --modules "/lib/modules/$kernel_version" \
+            --busybox /bin/busybox
+      - name: Upload QEMU serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-qemu-serial
+          path: target/btrfs-qemu.log
+          if-no-files-found: warn
+
+  btrfs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y btrfs-progs
+      - name: Test native btrfs sharing
+        shell: bash
+        run: |
+          set -euo pipefail
+          truncate -s 1G "$RUNNER_TEMP/dedupit.img"
+          mkfs.btrfs -f "$RUNNER_TEMP/dedupit.img"
+          mkdir "$RUNNER_TEMP/dedupit-btrfs"
+          sudo mount -o loop,compress=zstd "$RUNNER_TEMP/dedupit.img" "$RUNNER_TEMP/dedupit-btrfs"
+          trap 'sudo umount "$RUNNER_TEMP/dedupit-btrfs"' EXIT
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/dedupit-btrfs"
+          TMPDIR="$RUNNER_TEMP/dedupit-btrfs" cargo test --locked --all-targets -- --nocapture
