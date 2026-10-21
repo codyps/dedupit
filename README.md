@@ -92,9 +92,11 @@ before advancing their cursors or generation boundary.
 A successful apply therefore needs no destination reopening or mapping refresh
 on the next invocation. After a crash, startup queues every unconfirmed mapping.
 Unchanged files refresh their maps without reading contents or losing committed
-completions; changed files with provisional maps are fully rehashed because the
+completions when the maps still match. A mismatched provisional map requeues
+sharing jobs without rereading unchanged contents; changed files are fully rehashed because the
 filesystem transaction might have rolled back independently of SQLite. File
-hashes never adopt new timestamps merely because deduplication succeeded.
+hashes never adopt new timestamps merely because deduplication succeeded. If a
+post-sharing metadata probe fails, its job remains pending for safe replay.
 
 `--verify` ignores metadata caching and rehashes everything. Use it periodically,
 after restoring an index, or for filesystems with coarse/unreliable timestamps.
@@ -453,7 +455,7 @@ cycle the test kills an apply process with new completion records staged inside
 an unfinished batch, modifies files during downtime, and resumes `--apply`;
 each seed must exercise an apply interruption too.
 
-Six additional tests exercise 22 deterministic crash cases, concurrent writes during apply confirmation, and file-failure
+Seven additional tests exercise 23 deterministic crash cases, concurrent writes during apply confirmation, and file-failure
 cleanup: portable scans
 with spilled uncommitted WAL pages, btrfs discovery cursors and hash/queue
 acknowledgements, and apply before/after commits and between kernel sharing and
@@ -467,8 +469,8 @@ neighbors survive and failed-file records are removed; an injected cleanup
 failure must abort and roll back the entire unfinished batch. Random stress uses two-operation
 batches; deterministic cases cover both 64- and 1024-operation batches.
 
-The QEMU runner builds with the `test-failpoints` feature and requires all six
-batch crash and concurrent-write tests in the compiled test listing, so omission of the feature or a
+The QEMU runner builds with the `test-failpoints` feature and requires all seven
+batch crash, concurrent-write, and mapping-recovery tests in the compiled test listing, so omission of the feature or a
 required test fails CI. Stop hooks and the tiny SQLite cache used to force WAL
 spill exist only in that opt-in test build; normal builds contain neither.
 

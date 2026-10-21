@@ -685,14 +685,16 @@ impl Index {
             if complete {
                 self.test_hook("apply:shared")?;
                 #[cfg(target_os = "linux")]
-                if mapping_changed {
-                    crate::btrfs_scan::refresh_apply_mapping(
+                if mapping_changed
+                    && !crate::btrfs_scan::refresh_apply_mapping(
                         self,
                         target.file_id,
                         &destination,
                         &target.fingerprint,
                         stats,
-                    )?;
+                    )?
+                {
+                    return Ok(());
                 }
                 #[cfg(not(target_os = "linux"))]
                 let _ = mapping_changed;

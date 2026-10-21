@@ -106,6 +106,7 @@ REQUIRED_BATCH_TESTS = {
     "native_apply_caches_mappings_without_refresh_and_keeps_writes_incremental",
     "batch_crashes::apply_mapping_cache_recovers_before_and_after_filesystem_confirmation",
     "batch_crashes::apply_mapping_confirmation_does_not_hide_concurrent_writes_or_namespace_changes",
+    "batch_crashes::native_mapping_probe_failure_and_rolled_back_cache_leave_sharing_retryable",
     "batch_crashes::failed_file_cleanup_keeps_batch_neighbors_and_cleanup_failure_aborts_the_batch",
     "batch_crashes::portable_batches_recover_uncommitted_spilled_wal_and_keep_committed_files",
     "batch_crashes::native_batches_keep_discovery_cursors_and_hash_acknowledgements_atomic",

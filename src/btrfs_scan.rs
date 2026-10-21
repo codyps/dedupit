@@ -44,15 +44,16 @@ pub(crate) fn refresh_apply_mapping(
     file: &File,
     fingerprint: &[u8],
     stats: &mut Stats,
-) -> Result<()> {
+) -> Result<bool> {
     let baseline: Option<(Vec<u8>, i64)> = index.conn.query_row_cached(
         "SELECT e.incarnation,b.crawl_id FROM extent_state e JOIN btrfs_files b ON b.file_id=e.file_id WHERE e.file_id=?1",
         [file_id], |r| Ok((r.get(0)?, r.get(1)?)),
     ).optional()?;
     let Some((incarnation, crawl_id)) = baseline else {
-        return Ok(());
+        return Ok(true);
     };
     let capture = || -> Result<NativeView> {
+        index.test_hook("apply:mapping-probe")?;
         let before = file.metadata()?;
         ensure!(
             scan::fingerprint(&before) == fingerprint,
@@ -85,7 +86,10 @@ pub(crate) fn refresh_apply_mapping(
         })
     };
     let Ok(view) = capture() else {
-        return Ok(());
+        // The sharing is safe to replay, but without a captured map we cannot
+        // distinguish durable sharing from a filesystem rollback on restart.
+        // Leave this job pending rather than recording an uncertain completion.
+        return Ok(false);
     };
     // Register the durability barrier before staging any provisional cache.
     if let std::collections::hash_map::Entry::Vacant(entry) = index.mapping_sync.entry(crawl_id) {
@@ -97,7 +101,7 @@ pub(crate) fn refresh_apply_mapping(
         .execute_cached("INSERT INTO apply_mappings VALUES (?1)", [file_id])?;
     index.test_hook("apply:mapping-staged")?;
     stats.btrfs_mapping_updates += 1;
-    Ok(())
+    Ok(true)
 }
 
 /// SQLite batches can commit provisional maps before btrfs commits. Only this
@@ -1101,6 +1105,56 @@ mod tests {
             drop(index);
             assert_fresh_hash(&options);
         }
+    }
+
+    #[test]
+    fn rolled_back_apply_mappings_requeue_completed_sharing_without_rehashing() {
+        let (_dir, options, mut source, ino) = setup(Granularity::Both);
+        cycle(&options, &mut source).unwrap();
+        let (index, _) = open(&options, &source);
+        index
+            .conn
+            .execute(
+                "INSERT INTO apply_mappings SELECT file_id FROM btrfs_files WHERE ino=?1",
+                [ino],
+            )
+            .unwrap();
+        // SQLite remembers the post-apply mapping and a completed chunk job;
+        // the filesystem exposes its pre-apply mapping after a power loss.
+        index
+            .conn
+            .execute(
+                "UPDATE file_extents SET descriptor=?1",
+                [&extent(0, 12288, 200, 0, 2).descriptor],
+            )
+            .unwrap();
+        index
+            .conn
+            .execute_batch(
+                "UPDATE ranges SET pending=0;
+            INSERT INTO completed(target,source) SELECT max(id),min(id) FROM ranges WHERE kind=0;",
+            )
+            .unwrap();
+        drop(index);
+        let stats = cycle(&options, &mut source).unwrap();
+        assert_eq!(stats.files_seen, 1);
+        assert_eq!(stats.bytes_hashed, 0);
+        let (index, _) = open(&options, &source);
+        assert_eq!(
+            index
+                .conn
+                .query_row("SELECT COUNT(*) FROM completed", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(
+            index
+                .conn
+                .query_row("SELECT COUNT(*) FROM ranges WHERE pending=1", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap()
+                > 0
+        );
     }
 
     #[test]

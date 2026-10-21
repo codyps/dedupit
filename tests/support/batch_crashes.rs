@@ -563,6 +563,62 @@ fn apply_mapping_cache_recovers_before_and_after_filesystem_confirmation() {
 }
 
 #[test]
+fn native_mapping_probe_failure_and_rolled_back_cache_leave_sharing_retryable() {
+    let Some((_dir, options, contents)) = fixture(false) else {
+        return;
+    };
+    run(&options, false);
+    let output = cli(&options, true)
+        .env("DEDUPIT_TEST_FAILPOINT", "apply:mapping-probe")
+        .env("DEDUPIT_TEST_HIT", "3")
+        .env("DEDUPIT_TEST_ACTION", "error")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stats: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stats["jobs_completed"], 128);
+    let resumed = run(&options, true);
+    assert_eq!(resumed["jobs_completed"], 1);
+    verify(&options, &contents);
+
+    let (_dir, options, contents) = fixture(false).unwrap();
+    run(&options, false);
+    crash_at(&Crash {
+        database: &options.database,
+        root: &options.roots[0],
+        portable: false,
+        apply: true,
+        event: "apply:before-mapping-sync",
+        hit: 1,
+        batch_size: 64,
+    });
+    // Model a provisional map that differs from the filesystem after rollback.
+    // Durable completion alone must not suppress replay of this destination.
+    let conn = reader(&options.database);
+    drop(conn);
+    let conn = Connection::open(&options.database).unwrap();
+    conn.execute(
+        "UPDATE file_extents SET descriptor=zeroblob(length(descriptor))
+        WHERE file_id=(SELECT id FROM files WHERE path=?1)",
+        [options.roots[0]
+            .join("file-001")
+            .as_os_str()
+            .as_encoded_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+    let resumed = run(&options, true);
+    assert_eq!(resumed["jobs_completed"], 1);
+    assert!(resumed["bytes_already_shared"].as_u64().unwrap() >= 4096);
+    assert_eq!(resumed["bytes_hashed"], 0);
+    verify(&options, &contents);
+}
+
+#[test]
 fn apply_mapping_confirmation_does_not_hide_concurrent_writes_or_namespace_changes() {
     let Some((_dir, options, mut contents)) = fixture(false) else {
         return;

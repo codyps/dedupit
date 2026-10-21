@@ -391,6 +391,7 @@ fn index_file_inner(
                 .execute_cached("INSERT INTO seen VALUES (?1)", [id])?;
             if let Some(view) = native {
                 let tx = FileUpdate::new(&mut index.conn)?;
+                reconcile_provisional_mapping(&tx, *id, view)?;
                 store_extents(&tx, *id, view)?;
                 tx.commit()?;
             }
@@ -625,6 +626,52 @@ fn index_file_inner(
         stats.files_hashed += 1;
     } else {
         stats.files_unchanged += 1;
+    }
+    Ok(())
+}
+
+fn reconcile_provisional_mapping(
+    tx: &rusqlite::Connection,
+    file_id: i64,
+    view: &NativeView,
+) -> Result<()> {
+    let provisional = tx.query_row_cached(
+        "SELECT EXISTS(SELECT 1 FROM apply_mappings WHERE file_id=?1)",
+        [file_id],
+        |r| r.get::<_, bool>(0),
+    )?;
+    if !provisional {
+        return Ok(());
+    }
+    let mut statement = tx.prepare_cached(
+        "SELECT offset,length,descriptor FROM file_extents WHERE file_id=?1 ORDER BY offset",
+    )?;
+    let mut rows = statement.query([file_id])?;
+    let mut same = true;
+    for extent in &view.extents {
+        let Some(row) = rows.next()? else {
+            same = false;
+            break;
+        };
+        if row.get::<_, u64>(0)? != extent.offset
+            || row.get::<_, u64>(1)? != extent.length
+            || row.get_ref(2)?.as_blob()? != extent.descriptor
+        {
+            same = false;
+            break;
+        }
+    }
+    same &= rows.next()?.is_none();
+    drop(rows);
+    drop(statement);
+    if !same {
+        // SQLite may have committed a completion before a power loss rolled
+        // back btrfs sharing. Retain valid hashes but retry the uncertain work.
+        tx.execute_cached(
+            "DELETE FROM completed WHERE target IN (SELECT id FROM ranges WHERE file_id=?1)",
+            [file_id],
+        )?;
+        tx.execute_cached("UPDATE ranges SET pending=1 WHERE file_id=?1", [file_id])?;
     }
     Ok(())
 }
