@@ -1,0 +1,57 @@
+name: Native btrfs scale benchmark
+on:
+  workflow_dispatch:
+    inputs:
+      files:
+        description: Total real files, including four large/partial controls
+        default: '1000000'
+        required: true
+      repetitions:
+        description: Idle and small-change samples
+        default: '3'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  native-scale:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install kernel and VM tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 busybox-static btrfs-progs e2fsprogs cpio zstd time acl linux-image-generic
+      - name: Run native benchmark and full verification
+        env:
+          BENCH_FILES: ${{ inputs.files }}
+          BENCH_REPETITIONS: ${{ inputs.repetitions }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          kernel_image="$(find /boot -maxdepth 1 -name 'vmlinuz-*-generic' -printf '%f\n' | sort -V | tail -n 1)"
+          test -n "$kernel_image"
+          kernel_version="${kernel_image#vmlinuz-}"
+          sudo install -m 0644 "/boot/$kernel_image" "$RUNNER_TEMP/benchmark-kernel"
+          # Grant this runner access only when its host exposes KVM. The result
+          # records the selected accelerator, including an explicit TCG fallback.
+          if test -e /dev/kvm; then
+            sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          fi
+          python3 tools/profile_btrfs_qemu.py \
+            --kernel "$RUNNER_TEMP/benchmark-kernel" \
+            --modules "/lib/modules/$kernel_version" \
+            --busybox /bin/busybox --time /usr/bin/time \
+            --files "$BENCH_FILES" --repetitions "$BENCH_REPETITIONS" \
+            --memory-mib 4096 --cpus 2 --timeout 9000
+      - name: Upload measurements and complete guest log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-btrfs-scale-results
+          path: target/btrfs-scale-qemu/
+          if-no-files-found: error

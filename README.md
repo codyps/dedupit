@@ -329,6 +329,45 @@ arrays without constructing per-record JSON trees. The buffer flushes before
 final statistics, and output errors propagate. Recorded million-file measurements
 and their conditions are in [benchmarks/million-files.json](benchmarks/million-files.json).
 
+For **native discovery and apply at scale**, `tools/profile_btrfs_qemu.py`
+boots an isolated guest with CAP_SYS_ADMIN, a 24 GiB btrfs data disk and a separate
+8 GiB ext4 index disk. Release binaries and GNU `time` measure each new CLI
+process. Defaults are one million real files, three idle/change samples, 4 GiB
+of guest RAM and two CPUs. `--accel auto` uses accessible KVM or records TCG
+explicitly; emulated CPU timings must be interpreted accordingly.
+
+```sh
+python3 tools/profile_btrfs_qemu.py --kernel /path/to/bzImage \
+  --modules /lib/modules/KERNEL_VERSION --busybox /path/to/static/busybox \
+  --files 1000000 --repetitions 3
+```
+
+Install QEMU, btrfs-progs, e2fsprogs, cpio and GNU `time`; the same matching-kernel
+requirements as the correctness VM apply. The manual **Native btrfs scale
+benchmark** GitHub Actions workflow installs these dependencies and uploads the
+full serial log and JSON measurements. This expensive benchmark is separate
+from the mandatory correctness CI. Use `--files 1024` for a quick smoke run.
+
+Four files within the requested count are controls: two identical 8 MiB files
+and two 384 KiB files sharing only a middle 128 KiB range. Other files are 4 KiB
+members of 128 deterministic groups. Samples cover initial native indexing,
+initial `--apply`, post-apply mapping reconciliation, idle restarts, small-file
+writes, 4 KiB writes in the large shared destination, new duplicate files and a
+write to the representative of a large duplicate group. Catch-up samples are
+reported separately, including the first restart after sharing changes extent
+mappings. Newly created duplicate files increase the final count by the number
+of repetitions. The representative case reports how many completion records
+its change invalidates and how many jobs get replayed.
+
+All original file bytes and inode identities are checked against the fixture
+model after sharing and writes. A fresh portable `--verify` scan must have the
+same complete logical inventory, with SQLite integrity and foreign-key checks
+on both indexes. The runner rejects fallback discovery, missing samples, partial
+verification, non-idle idle samples or omitted full-file/partial-range sharing.
+Measurements and progress are streamed to `target/btrfs-scale-qemu/`; disposable
+VM disks are removed afterward. These results include VM storage and filesystem
+synchronization costs and do not represent bare-metal throughput.
+
 ## Validation
 
 ```sh
