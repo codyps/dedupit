@@ -9,11 +9,18 @@ import argparse
 import gzip
 import json
 import lzma
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
+
+
+def accelerator(request):
+    if request == 'auto':
+        return 'kvm' if os.access('/dev/kvm', os.R_OK | os.W_OK) else 'tcg'
+    return request
 
 
 def copy_binary(binary, root, destination=None):
@@ -130,6 +137,7 @@ def main():
                         help="matching lib/modules/<kernel-version> directory")
     parser.add_argument("--busybox", required=True, help="static BusyBox executable")
     parser.add_argument("--qemu", default="qemu-system-x86_64")
+    parser.add_argument("--accel", choices=["auto", "kvm", "tcg"], default="auto")
     parser.add_argument("--cargo", default="cargo")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--log", type=Path, default=Path("target/btrfs-qemu.log"))
@@ -217,13 +225,16 @@ finish 0
         with disk.open("wb") as image:
             image.truncate(1024 * 1024 * 1024)
         subprocess.run(["mkfs.btrfs", "-f", str(disk)], check=True)
-        command = [args.qemu, "-accel", "tcg", "-m", "1024", "-smp", "2",
+        accel = accelerator(args.accel)
+        command = [args.qemu, "-accel", accel, "-m", "1024", "-smp", "2",
                    "-display", "none", "-serial", "stdio", "-monitor", "none",
                    "-nic", "none", "-no-reboot", "-kernel", str(args.kernel),
                    "-initrd", str(initrd), "-append", "console=ttyS0 rdinit=/init panic=-1",
                    "-drive", f"file={disk},format=raw,if=virtio"]
-        print("Running QEMU with TCG; serial output:", args.log, flush=True)
+        print(f"Running QEMU with {accel}; serial output:", args.log, flush=True)
         with args.log.open("w") as log:
+            log.write(f"DEDUPIT_QEMU_ACCEL={accel}\n")
+            log.flush()
             result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
                                     timeout=args.timeout)
         serial = args.log.read_text()

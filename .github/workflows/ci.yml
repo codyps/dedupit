@@ -27,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 busybox-static btrfs-progs e2fsprogs cpio zstd linux-image-generic
+            qemu-system-x86 busybox-static btrfs-progs e2fsprogs cpio zstd acl linux-image-generic
       - name: Run privileged discovery and apply/restart stress tests in QEMU
         shell: bash
         run: |
@@ -39,6 +39,9 @@ jobs:
           test -f "/lib/modules/$kernel_version/modules.dep"
           # Ubuntu kernel images can be root-readable only. QEMU runs unprivileged.
           sudo install -m 0644 "/boot/$kernel_image" "$RUNNER_TEMP/btrfs-test-kernel"
+          if test -e /dev/kvm; then
+            sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          fi
           python3 tools/test-btrfs-qemu.py \
             --kernel "$RUNNER_TEMP/btrfs-test-kernel" \
             --modules "/lib/modules/$kernel_version" \

@@ -98,6 +98,7 @@ def main():
     parser.add_argument('--busybox', required=True)
     parser.add_argument('--cargo', default='cargo')
     parser.add_argument('--qemu', default='qemu-system-x86_64')
+    parser.add_argument('--accel', choices=['auto', 'kvm', 'tcg'], default='auto')
     parser.add_argument('--mkfs-ext4', default='mkfs.ext4')
     parser.add_argument('--timeout', type=int, default=300)
     parser.add_argument('--log', type=Path, default=Path('target/btrfs-powercut-qemu.log'))
@@ -165,6 +166,8 @@ cmp /state/expected-inodes /state/actual-inodes
 echo DEDUPIT_POWER_RECOVERY_STATS
 /dedupit --database /state/index.sqlite --scanner btrfs --chunk-size 4096 --json --apply /data/input
 sha256sum -c /state/expected-sha256
+stat -c '%i:%s:%f:%h' /data/input/a /data/input/b > /state/actual-inodes
+cmp /state/expected-inodes /state/actual-inodes
 echo DEDUPIT_POWER_IDLE_STATS
 /dedupit --database /state/index.sqlite --scanner btrfs --chunk-size 4096 --json --apply /data/input
 echo DEDUPIT_POWER_RECOVERY_OK
@@ -185,13 +188,16 @@ poweroff -f
         subprocess.run(['mkfs.btrfs', '-f', str(data)], check=True)
         subprocess.run([args.mkfs_ext4, '-t', 'ext4', '-F', '-q', '-E',
                         'lazy_itable_init=0,lazy_journal_init=0', str(state)], check=True)
-        command = [args.qemu, '-accel', 'tcg', '-m', '1024', '-smp', '2', '-display', 'none',
+        accel = helpers.accelerator(args.accel)
+        command = [args.qemu, '-accel', accel, '-m', '1024', '-smp', '2', '-display', 'none',
                    '-serial', 'stdio', '-monitor', 'none', '-nic', 'none', '-no-reboot',
                    '-kernel', str(args.kernel), '-initrd', str(initrd),
                    '-append', 'console=ttyS0 rdinit=/init panic=-1',
                    '-drive', f'file={data},format=raw,if=virtio',
                    '-drive', f'file={state},format=raw,if=virtio']
         with args.log.open('wb') as log:
+            log.write(f'DEDUPIT_QEMU_ACCEL={accel}\n'.encode())
+            log.flush()
             cut = boot(command, log, args.timeout, True)
             recovered = boot(command, log, args.timeout, False)
         validate(cut, recovered)

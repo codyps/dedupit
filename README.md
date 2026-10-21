@@ -530,7 +530,9 @@ To run the privileged tests without granting the host additional capabilities,
 use the QEMU runner. It boots an x86_64 Linux kernel with a small initramfs,
 checks that the guest has `CAP_SYS_ADMIN`, and runs all discovery tests with
 `DEDUPIT_REQUIRE_BTRFS_SCANNER=1` on a disposable 1 GiB btrfs disk mounted with
-zstd compression. Software emulation (TCG) works without `/dev/kvm`. The guest
+zstd compression. Both correctness runners automatically use accessible KVM;
+`--accel tcg` forces software emulation, which works without `/dev/kvm`. An
+explicit `--accel kvm` request fails if KVM is unavailable. The guest
 has no networking or shared host directories. A failed test, skipped scanner,
 boot failure, timeout, ignored test, or incomplete test suite fails the runner.
 

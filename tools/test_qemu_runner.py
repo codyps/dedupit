@@ -2,12 +2,25 @@
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location(
     "qemu_runner", Path(__file__).with_name("test-btrfs-qemu.py")
 )
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
+
+
+class AcceleratorTests(unittest.TestCase):
+    def test_auto_uses_accessible_kvm_and_otherwise_tcg(self):
+        for available, expected in [(True, 'kvm'), (False, 'tcg')]:
+            with self.subTest(available=available), mock.patch.object(runner.os, 'access', return_value=available):
+                self.assertEqual(runner.accelerator('auto'), expected)
+
+    def test_explicit_accelerator_never_silently_changes(self):
+        with mock.patch.object(runner.os, 'access', return_value=False):
+            self.assertEqual(runner.accelerator('kvm'), 'kvm')
+            self.assertEqual(runner.accelerator('tcg'), 'tcg')
 
 
 def serial(passed=5, failed=0, ignored=0, filtered=0, marker="0"):
