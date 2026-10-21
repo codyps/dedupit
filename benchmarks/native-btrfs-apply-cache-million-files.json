@@ -1485,7 +1485,8 @@
       "idle_after_apply_median_seconds": 0.045991301,
       "initial_index_seconds": 251.002848498,
       "oracle_full_scan_seconds": 191.338987501,
-      "index_after_followup_bytes": 719306752
+      "index_after_followup_bytes": 719306752,
+      "apply_plus_first_followup_database_batches": 1962
     },
     "after": {
       "apply_seconds": 242.719874564,
@@ -1497,7 +1498,8 @@
       "idle_after_apply_median_seconds": 0.113487046,
       "initial_index_seconds": 315.074348214,
       "oracle_full_scan_seconds": 234.252373052,
-      "index_after_followup_bytes": 683577344
+      "index_after_followup_bytes": 683577344,
+      "apply_plus_first_followup_database_batches": 985
     }
   },
   "additional_host_run": {
@@ -1521,5 +1523,6 @@
     "Each 4 KiB write in the shared 8 MiB destination hashes one 128 KiB chunk and reuses 63. Source-dependent completion replay remains bounded without reading unchanged contents.",
     "Peak RSS belongs to the actual dedupit CLI, excluding guest kernel page cache, test driver and VM host. Native index size includes allocated SQLite pages, including the freelist.",
     "The exact benchmark source commit and executable digest are retained. Subsequent commits add QEMU power-cut validation and refine crash-test assertions without changing the successful-apply algorithm."
-  ]
+  ],
+  "controlled_comparison_record": "benchmarks/native-btrfs-apply-cache-paired-100k.json"
 }

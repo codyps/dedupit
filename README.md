@@ -403,7 +403,7 @@ measurements with the conditions and every sample retained in the JSON record.
 The earlier native record predates mapping capture during apply. The
 [updated million-file run](benchmarks/native-btrfs-apply-cache-million-files.json)
 confirmed 999,870 destination mappings during `--apply`. Its very first following
-invocation took **148 ms**, with **zero file opens, content reads, or sharing
+invocation took **148 ms**, with **zero input-file opens, content reads, or sharing
 jobs**, replacing the earlier 43.9-second refresh. Subsequent idle applies had a
 113 ms median. All 1,000,003 final files passed byte/inode checks and matched a
 fresh full scan; each 4 KiB write in the shared 8 MiB control still reused 63 of
@@ -419,6 +419,20 @@ The JSON retains both totals and every sample rather than presenting the removed
 refresh as free work. The benchmark workflow's `compare_baseline=true` option
 runs the earlier baseline and current build sequentially on one host, in fresh
 VMs with the same resources and fixture model, for a more useful comparison.
+
+A [matched 100,000-file KVM comparison](benchmarks/native-btrfs-apply-cache-paired-100k.json)
+on one host measured apply plus first follow-up at **15.35 seconds before** and
+**11.91 seconds after**, a **22.4% reduction**. Apply itself increased from 7.18
+to 11.89 seconds, while the following refresh fell from 8.17 seconds to 16 ms
+with no input-file opens. Both variants passed all 100,003 final byte/inode and
+fresh-scan checks. This is one timing pair, not an estimate of the percentage
+gain at a million files. The million-file run reduced explicit database batches
+for apply plus first follow-up from 1,962 to 985 by sharing apply transactions
+with mapping updates.
+
+The comparison gate rejects different accelerators, VM resources, guest kernels
+or fixture sizes, unverified runs, and reused executable hashes. Project release
+artifacts are cleaned between worktrees while dependency artifacts stay cached.
 
 ## Validation
 
