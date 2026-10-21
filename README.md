@@ -368,6 +368,22 @@ Measurements and progress are streamed to `target/btrfs-scale-qemu/`; disposable
 VM disks are removed afterward. These results include VM storage and filesystem
 synchronization costs and do not represent bare-metal throughput.
 
+A [recorded million-file native run](benchmarks/native-btrfs-million-files.json)
+on QEMU/KVM with two vCPUs, 4 GiB RAM and Linux 6.8 measured 251 seconds for
+initial indexing and 156 seconds for 999,869 full-file jobs plus one partial-range
+job. The first post-apply mapping refresh took another 43.9 seconds, opening
+999,870 changed destinations but reading no contents. Subsequent idle `--apply`
+runs had a median of 46 ms with no old-file opens, content reads or sharing jobs.
+Small-file writes took 186 ms; 4 KiB writes inside an 8 MiB shared file took
+172 ms, reading one 128 KiB chunk and reusing 63. Adding/applying a new duplicate
+took 155 ms. A representative-source write took 3.72 seconds and replayed 7,811
+completion jobs while hashing only the changed 4 KiB file. Small-change and idle
+times are medians of three samples; initial operations and representative writes
+are single samples. Peak application RSS was 9.5 MiB, with a 686 MiB native index
+after reconciliation. All 1,000,003 final files passed byte checks, original inode
+identities were preserved, and the index matched a fresh full scan. These are VM
+measurements with the conditions and every sample retained in the JSON record.
+
 ## Validation
 
 ```sh
