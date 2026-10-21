@@ -10,6 +10,10 @@ on:
         description: Idle and small-change samples
         default: '3'
         required: true
+      compare_baseline:
+        description: Also run the pre-mapping-cache baseline on this same host
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -20,6 +24,8 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Install kernel and VM tools
         run: |
@@ -30,6 +36,7 @@ jobs:
         env:
           BENCH_FILES: ${{ inputs.files }}
           BENCH_REPETITIONS: ${{ inputs.repetitions }}
+          BENCH_BASELINE: ${{ inputs.compare_baseline }}
         shell: bash
         run: |
           set -euo pipefail
@@ -41,6 +48,23 @@ jobs:
           # records the selected accelerator, including an explicit TCG fallback.
           if test -e /dev/kvm; then
             sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          fi
+          if test "$BENCH_BASELINE" = true; then
+            baseline_tree="$RUNNER_TEMP/dedupit-benchmark-baseline"
+            git worktree add --detach "$baseline_tree" 7c36e6d2644acc97c0187075178f6e0b22461fb5
+            (
+              cd "$baseline_tree"
+              CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/baseline-build" \
+                python3 tools/profile_btrfs_qemu.py \
+                --kernel "$RUNNER_TEMP/benchmark-kernel" \
+                --modules "/lib/modules/$kernel_version" \
+                --busybox /bin/busybox --time /usr/bin/time \
+                --files "$BENCH_FILES" --repetitions "$BENCH_REPETITIONS" \
+                --memory-mib 4096 --cpus 2 --timeout 9000 \
+                --output "$GITHUB_WORKSPACE/target/btrfs-scale-qemu/baseline/results.json" \
+                --log "$GITHUB_WORKSPACE/target/btrfs-scale-qemu/baseline/serial.log"
+            )
+            git worktree remove "$baseline_tree"
           fi
           python3 tools/profile_btrfs_qemu.py \
             --kernel "$RUNNER_TEMP/benchmark-kernel" \
