@@ -580,7 +580,17 @@ fn native_mapping_probe_failure_and_rolled_back_cache_leave_sharing_retryable() 
         String::from_utf8_lossy(&output.stderr)
     );
     let stats: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(stats["jobs_completed"], 128);
+    assert!(stats["jobs_attempted"].as_u64().unwrap() > stats["jobs_completed"].as_u64().unwrap());
+    assert_eq!(
+        reader(&options.database)
+            .query_row(
+                "SELECT COUNT(*) FROM ranges WHERE kind=1 AND pending=1",
+                [],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+        1
+    );
     let resumed = run(&options, true);
     assert_eq!(resumed["jobs_completed"], 1);
     verify(&options, &contents);

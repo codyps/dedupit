@@ -469,6 +469,22 @@ neighbors survive and failed-file records are removed; an injected cleanup
 failure must abort and roll back the entire unfinished batch. Random stress uses two-operation
 batches; deterministic cases cover both 64- and 1024-operation batches.
 
+CI also boots a separate two-disk VM, with btrfs data and an ext4 index. After
+SQLite durably records sharing, the guest stops before btrfs commits the new
+mapping. The host sends SIGKILL to QEMU without guest sync or shutdown, then
+boots the same disks again. Recovery must detect the rolled-back mapping,
+repeat kernel sharing without rehashing, preserve bytes and original inode
+identities, and finish with an idle run. A successful reboot alone cannot pass:
+the test requires actual lost sharing and a new 4 KiB deduplication operation.
+The log is uploaded alongside the discovery-suite log. Run it separately with:
+
+```sh
+python3 tools/test_btrfs_powercut_qemu.py \
+  --kernel /path/to/bzImage \
+  --modules /lib/modules/KERNEL_VERSION \
+  --busybox /path/to/static/busybox
+```
+
 The QEMU runner builds with the `test-failpoints` feature and requires all seven
 batch crash, concurrent-write, and mapping-recovery tests in the compiled test listing, so omission of the feature or a
 required test fails CI. Stop hooks and the tiny SQLite cache used to force WAL

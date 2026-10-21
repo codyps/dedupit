@@ -27,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 busybox-static btrfs-progs cpio zstd linux-image-generic
+            qemu-system-x86 busybox-static btrfs-progs e2fsprogs cpio zstd linux-image-generic
       - name: Run privileged discovery and apply/restart stress tests in QEMU
         shell: bash
         run: |
@@ -44,12 +44,18 @@ jobs:
             --modules "/lib/modules/$kernel_version" \
             --busybox /bin/busybox \
             --stress-rounds 16
+          python3 tools/test_btrfs_powercut_qemu.py \
+            --kernel "$RUNNER_TEMP/btrfs-test-kernel" \
+            --modules "/lib/modules/$kernel_version" \
+            --busybox /bin/busybox
       - name: Upload QEMU serial log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: btrfs-qemu-serial
-          path: target/btrfs-qemu.log
+          path: |
+            target/btrfs-qemu.log
+            target/btrfs-powercut-qemu.log
           if-no-files-found: warn
 
   btrfs:
