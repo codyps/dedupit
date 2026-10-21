@@ -60,7 +60,7 @@ Default chunk size is 128 KiB. Supported sizes are powers of two from 4 KiB to
 space, hashing, and ioctl calls. There is no background service: schedule the
 same command periodically for continuous incremental operation.
 
-Database commits default to **64 operations per batch**. Batches also flush
+Database commits default to **1024 operations per batch**. Batches also flush
 after 64 MiB of processed data or one second, checked between atomic operations;
 a single large file, directory job, metadata page, or sharing job can exceed
 those budgets. `--commit-batch-size 1` selects individual operation commits;
@@ -178,7 +178,15 @@ Every **portable** run still walks directory entries and reads metadata: generic
 do not supply a persistent, portable change journal. Incrementality saves
 content reads and repeated sharing operations, not traversal. Content reads use
 a lazily allocated chunk buffer reused across files; native mapping comparisons use memory proportional to
-the extent count of the changed file. Duplicate listings stream.
+the extent count of the changed file. Native directory reconciliation streams
+cached child paths; it retains the names of the current directory only when
+there are previously indexed files to check. Very wide directories and highly
+fragmented files can therefore exceed ordinary scan memory usage. Duplicate
+listings stream groups and their ranges in index order, without sorting all
+duplicate paths or loading singleton paths. Native queue selection seeks by
+subvolume, job kind and inode; failed jobs remain retryable without repeatedly
+scanning the already attempted prefix. Newly queued earlier inodes are picked up
+in another pass during the same invocation.
 
 ## Native sharing and correctness
 
@@ -288,6 +296,39 @@ sync overhead while retaining atomic file/job updates and identity validation.
 index insertion dominate dense small-chunk scans. Use CPU/heap profilers
 separately from wall-time benchmarks.
 
+For file-count scaling, `tools/profile_scale.py` creates **one million actual
+4 KiB files** in 1,000 directories, with 128 deterministic content groups. Fixture
+generation streams filenames and is excluded from measurements. It measures a
+fresh index, unchanged scans, single-file changes and optional complete JSON
+listing, recording CPU, wall time, peak RSS and index size. Each binary uses its
+own database. The harness checks expected duplicate counts, SQLite integrity and
+foreign keys, and records a complete range-inventory digest for comparison.
+
+```sh
+python3 tools/profile_scale.py --binary /path/to/before \
+  --directory target/profile-million --label before --repetitions 3 --list
+python3 tools/profile_scale.py --binary target/release/dedupit \
+  --directory target/profile-million --label after --repetitions 3 --reuse --list
+cmp target/profile-million/{before,after}.inventory
+```
+
+Pass `--time /path/to/time` to select GNU `time`, and optionally
+`--commit-batch-size 64` to compare commit policies. All data and indexes remain
+in the chosen directory for inspection. Measurements use a warm filesystem
+cache and durable commits; initial scans and listing each have one timing sample,
+while unchanged and changed runs repeat. Portable restart time grows with file
+count because every file still needs a metadata check. Native idle discovery
+avoids that traversal, although filesystem synchronization can dominate runtime.
+Index storage grows with files and cached chunks; a smaller chunk size increases
+that cost.
+
+CPU profiles of large reports also identified JSON value construction and
+formatted stdout writes as major costs. Reports now serialize borrowed fields
+directly into a 64 KiB output buffer, preserving the JSON schema and byte-path
+arrays without constructing per-record JSON trees. The buffer flushes before
+final statistics, and output errors propagate. Recorded million-file measurements
+and their conditions are in [benchmarks/million-files.json](benchmarks/million-files.json).
+
 ## Validation
 
 ```sh
@@ -343,7 +384,7 @@ cycle the test kills an apply process with new completion records staged inside
 an unfinished batch, modifies files during downtime, and resumes `--apply`;
 each seed must exercise an apply interruption too.
 
-Four additional tests exercise 13 deterministic crash cases and file-failure
+Four additional tests exercise 15 deterministic crash cases and file-failure
 cleanup: portable scans
 with spilled uncommitted WAL pages, btrfs discovery cursors and hash/queue
 acknowledgements, and apply before/after commits and between kernel sharing and
@@ -355,7 +396,7 @@ compare against a fresh full scan, verify contents and copy-on-write isolation,
 and check SQLite integrity/foreign keys. Injected file errors prove successful
 neighbors survive and failed-file records are removed; an injected cleanup
 failure must abort and roll back the entire unfinished batch. Random stress uses two-operation
-batches; the deterministic cases use the default 64-operation batches.
+batches; deterministic cases cover both 64- and 1024-operation batches.
 
 The QEMU runner builds with the `test-failpoints` feature and requires all four
 batch crash tests in the compiled test listing, so omission of the feature or a

@@ -332,12 +332,17 @@ fn verify(options: &Options, contents: &Contents) {
 
 #[test]
 fn portable_batches_recover_uncommitted_spilled_wal_and_keep_committed_files() {
-    for (event, hit) in [
-        ("portable:staged", 63),
-        ("portable:before-commit", 1),
-        ("portable:after-commit", 1),
+    for (event, hit, batch_size) in [
+        ("portable:staged", 63, 64),
+        ("portable:before-commit", 1, 64),
+        ("portable:after-commit", 1, 64),
+        // The larger default must recover spilled, uncommitted hashes, and
+        // must also retain its final partially filled batch on normal flush.
+        ("portable:staged", 100, 1024),
+        ("portable:after-commit", 1, 1024),
     ] {
-        let (_dir, options, contents) = fixture(true).unwrap();
+        let (_dir, mut options, contents) = fixture(true).unwrap();
+        options.commit_batch_size = batch_size;
         let observation = crash_at(&Crash {
             database: &options.database,
             root: &options.roots[0],
@@ -345,7 +350,7 @@ fn portable_batches_recover_uncommitted_spilled_wal_and_keep_committed_files() {
             apply: false,
             event,
             hit,
-            batch_size: 64,
+            batch_size,
         });
         if event == "portable:staged" {
             assert!(

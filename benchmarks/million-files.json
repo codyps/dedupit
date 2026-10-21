@@ -1,0 +1,898 @@
+{
+  "date": "2026-10-20",
+  "environment": {
+    "cpu": "AMD Ryzen 3 PRO 5350GE, 4 cores / 8 threads",
+    "ram_gib": 62,
+    "kernel": "Linux 6.18.55",
+    "filesystem": "btrfs",
+    "scanner": "portable",
+    "granularity": "both",
+    "chunk_bytes": 131072,
+    "sqlite": "WAL, synchronous=FULL",
+    "cache": "warm OS filesystem cache; OS cache is additional to process RSS"
+  },
+  "fixture": {
+    "files": 1000000,
+    "size": 4096,
+    "groups": 128,
+    "per_directory": 1000,
+    "seed": 20261020
+  },
+  "baseline_commit": "5cee258743751c00b565362b270bf4c8f82c31fb",
+  "profiled_binaries_sha256": {
+    "scale-before": "8923631e96de3b7f4fe352d3fad86133af9fc2db7710abc4459e1e602134cb25",
+    "scale-after": "c4d5ff469f2ddbc04d7fd7b8ed9ca62e65b9ba21ce45145a3f2f211f514f181f",
+    "scale-after-output": "d8a21dac6cb763229048ddca311bbb9ed9f41bd0c7cafa05968a2584406a988f"
+  },
+  "method": [
+    "Release builds with debug symbols; GNU time measures actual child peak RSS.",
+    "Fixture creation excluded. Initial scan uses an empty database, not a cold device cache.",
+    "Three idle and one-file-change samples per version; one initial scan and complete listing sample.",
+    "Initial baseline overlapped exploratory SQL/CPU/policy profiling. Storage latency varies; initial wall-time speedup is an observation, not an isolated causal estimate.",
+    "Cold/idle/changed after samples used scale-after; final listing used scale-after-output, adding borrowed serialization and buffered output. Later native directory changes are outside the portable benchmark path.",
+    "Listing includes the portable metadata walk and JSON serialization of all records to /dev/null.",
+    "Native btrfs discovery/apply correctness is tested in QEMU; these timings do not measure native discovery or apply."
+  ],
+  "summary": {
+    "cold": {
+      "before": {
+        "samples": 1,
+        "seconds": 455.2266967059113,
+        "cpu_seconds": 162.84065900000002,
+        "peak_rss_kib": 10196,
+        "database_batches": [
+          15625
+        ]
+      },
+      "after": {
+        "samples": 1,
+        "seconds": 174.25904155895114,
+        "cpu_seconds": 109.92535099999999,
+        "peak_rss_kib": 9808,
+        "database_batches": [
+          977
+        ]
+      }
+    },
+    "idle": {
+      "before": {
+        "samples": 3,
+        "seconds": 8.346685370081104,
+        "cpu_seconds": 8.312002,
+        "peak_rss_kib": 9600,
+        "database_batches": [
+          15625,
+          15625,
+          15625
+        ]
+      },
+      "after": {
+        "samples": 3,
+        "seconds": 8.30123686697334,
+        "cpu_seconds": 8.264453,
+        "peak_rss_kib": 9596,
+        "database_batches": [
+          977,
+          977,
+          977
+        ]
+      }
+    },
+    "changed": {
+      "before": {
+        "samples": 3,
+        "seconds": 8.671856708009727,
+        "cpu_seconds": 8.610729,
+        "peak_rss_kib": 9600,
+        "database_batches": [
+          15625,
+          15625,
+          15625
+        ]
+      },
+      "after": {
+        "samples": 3,
+        "seconds": 8.377585445065051,
+        "cpu_seconds": 8.31463,
+        "peak_rss_kib": 9516,
+        "database_batches": [
+          977,
+          977,
+          977
+        ]
+      }
+    },
+    "list": {
+      "before": {
+        "samples": 1,
+        "seconds": 29.28,
+        "cpu_seconds": 29.18,
+        "peak_rss_kib": 9812
+      },
+      "after": {
+        "samples": 1,
+        "seconds": 16.66,
+        "cpu_seconds": 16.59,
+        "peak_rss_kib": 9480
+      }
+    }
+  },
+  "database_bytes": 609517568,
+  "range_inventory_sha256": "ac35856bf8b2ea7860f904e196dd9274bee6ddee889d5c478493761abfe7748f",
+  "listing_verification": {
+    "records": 1999742,
+    "sha256": "d89f005464216d345f7f71086a8e61a6cabf35bb9eea1b98abb5788169d351c2",
+    "comparison": "Byte-identical duplicate JSON lines from both binaries on the same million-file index; final stats excluded."
+  },
+  "heap_profile": {
+    "files": 10000,
+    "scope": "unchanged portable scan plus JSON listing; same fixture subset and SQLite index",
+    "profiler": "heaptrack, equivalent ELFs retargeted to the profiler glibc for both versions",
+    "before_allocation_calls": 439416,
+    "after_allocation_calls": 123213,
+    "before_peak_heap_decimal_mb_rounded": 4.36,
+    "after_peak_heap_decimal_mb_rounded": 2.36,
+    "instrumented_times_used_for_speed_claims": false
+  },
+  "queue_microbenchmark": {
+    "scope": "Python SQLite in-memory failed-job selection and attempted insert; no file hashing, ioctls or durable database I/O",
+    "before": [
+      {
+        "jobs": 1000,
+        "seconds": 0.08911049598827958
+      },
+      {
+        "jobs": 2000,
+        "seconds": 0.3666315389564261
+      },
+      {
+        "jobs": 4000,
+        "seconds": 1.443001042935066
+      }
+    ],
+    "after": [
+      {
+        "jobs": 1000,
+        "seconds": 0.0029602949507534504
+      },
+      {
+        "jobs": 2000,
+        "seconds": 0.005844034953042865
+      },
+      {
+        "jobs": 4000,
+        "seconds": 0.011845950037240982
+      },
+      {
+        "jobs": 1000000,
+        "seconds": 3.282076596049592
+      }
+    ],
+    "regression_test": "Rust test counts SQLite VM steps for 20,000 retained failed jobs, with 20,000 interleaved file jobs."
+  },
+  "samples": {
+    "before": [
+      {
+        "case": "cold",
+        "seconds": 455.2266967059113,
+        "cpu_seconds": 162.84065900000002,
+        "peak_rss_kib": 10196,
+        "database_bytes": 609513472,
+        "stats": {
+          "database_batches": 15625,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 1000000,
+          "files_unchanged": 0,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 4096000000,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999872,
+          "duplicate_file_bytes": 4095475712,
+          "duplicate_chunks": 999872,
+          "duplicate_chunk_bytes": 4095475712,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      },
+      {
+        "case": "idle",
+        "seconds": 8.593326929956675,
+        "cpu_seconds": 8.443166,
+        "peak_rss_kib": 9540,
+        "database_bytes": 609513472,
+        "stats": {
+          "database_batches": 15625,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 0,
+          "files_unchanged": 1000000,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 0,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999872,
+          "duplicate_file_bytes": 4095475712,
+          "duplicate_chunks": 999872,
+          "duplicate_chunk_bytes": 4095475712,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      },
+      {
+        "case": "changed",
+        "seconds": 9.25706982507836,
+        "cpu_seconds": 8.881530999999999,
+        "peak_rss_kib": 9600,
+        "database_bytes": 609513472,
+        "stats": {
+          "database_batches": 15625,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 1,
+          "files_unchanged": 999999,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 4096,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999871,
+          "duplicate_file_bytes": 4095471616,
+          "duplicate_chunks": 999871,
+          "duplicate_chunk_bytes": 4095471616,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      },
+      {
+        "case": "idle",
+        "seconds": 8.344036952941678,
+        "cpu_seconds": 8.311234,
+        "peak_rss_kib": 9608,
+        "database_bytes": 609513472,
+        "stats": {
+          "database_batches": 15625,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 0,
+          "files_unchanged": 1000000,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 0,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999872,
+          "duplicate_file_bytes": 4095475712,
+          "duplicate_chunks": 999872,
+          "duplicate_chunk_bytes": 4095475712,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      },
+      {
+        "case": "changed",
+        "seconds": 8.671856708009727,
+        "cpu_seconds": 8.610729,
+        "peak_rss_kib": 9456,
+        "database_bytes": 609513472,
+        "stats": {
+          "database_batches": 15625,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 1,
+          "files_unchanged": 999999,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 4096,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999871,
+          "duplicate_file_bytes": 4095471616,
+          "duplicate_chunks": 999871,
+          "duplicate_chunk_bytes": 4095471616,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      },
+      {
+        "case": "idle",
+        "seconds": 8.346685370081104,
+        "cpu_seconds": 8.312002,
+        "peak_rss_kib": 9600,
+        "database_bytes": 609513472,
+        "stats": {
+          "database_batches": 15625,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 0,
+          "files_unchanged": 1000000,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 0,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999872,
+          "duplicate_file_bytes": 4095475712,
+          "duplicate_chunks": 999872,
+          "duplicate_chunk_bytes": 4095475712,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      },
+      {
+        "case": "changed",
+        "seconds": 8.585676431073807,
+        "cpu_seconds": 8.528564,
+        "peak_rss_kib": 9680,
+        "database_bytes": 609513472,
+        "stats": {
+          "database_batches": 15625,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 1,
+          "files_unchanged": 999999,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 4096,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999871,
+          "duplicate_file_bytes": 4095471616,
+          "duplicate_chunks": 999871,
+          "duplicate_chunk_bytes": 4095471616,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      }
+    ],
+    "after": [
+      {
+        "case": "cold",
+        "seconds": 174.25904155895114,
+        "cpu_seconds": 109.92535099999999,
+        "peak_rss_kib": 9808,
+        "database_bytes": 609517568,
+        "stats": {
+          "database_batches": 977,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 1000000,
+          "files_unchanged": 0,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 4096000000,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999872,
+          "duplicate_file_bytes": 4095475712,
+          "duplicate_chunks": 999872,
+          "duplicate_chunk_bytes": 4095475712,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      },
+      {
+        "case": "idle",
+        "seconds": 8.3357003350975,
+        "cpu_seconds": 8.299661,
+        "peak_rss_kib": 9596,
+        "database_bytes": 609517568,
+        "stats": {
+          "database_batches": 977,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 0,
+          "files_unchanged": 1000000,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 0,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999872,
+          "duplicate_file_bytes": 4095475712,
+          "duplicate_chunks": 999872,
+          "duplicate_chunk_bytes": 4095475712,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      },
+      {
+        "case": "changed",
+        "seconds": 8.359501258004457,
+        "cpu_seconds": 8.303582,
+        "peak_rss_kib": 9368,
+        "database_bytes": 609517568,
+        "stats": {
+          "database_batches": 977,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 1,
+          "files_unchanged": 999999,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 4096,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999871,
+          "duplicate_file_bytes": 4095471616,
+          "duplicate_chunks": 999871,
+          "duplicate_chunk_bytes": 4095471616,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      },
+      {
+        "case": "idle",
+        "seconds": 8.206123531912453,
+        "cpu_seconds": 8.172846,
+        "peak_rss_kib": 9752,
+        "database_bytes": 609517568,
+        "stats": {
+          "database_batches": 977,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 0,
+          "files_unchanged": 1000000,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 0,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999872,
+          "duplicate_file_bytes": 4095475712,
+          "duplicate_chunks": 999872,
+          "duplicate_chunk_bytes": 4095475712,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      },
+      {
+        "case": "changed",
+        "seconds": 8.377585445065051,
+        "cpu_seconds": 8.31463,
+        "peak_rss_kib": 9520,
+        "database_bytes": 609517568,
+        "stats": {
+          "database_batches": 977,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 1,
+          "files_unchanged": 999999,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 4096,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999871,
+          "duplicate_file_bytes": 4095471616,
+          "duplicate_chunks": 999871,
+          "duplicate_chunk_bytes": 4095471616,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      },
+      {
+        "case": "idle",
+        "seconds": 8.30123686697334,
+        "cpu_seconds": 8.264453,
+        "peak_rss_kib": 9428,
+        "database_bytes": 609517568,
+        "stats": {
+          "database_batches": 977,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 0,
+          "files_unchanged": 1000000,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 0,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999872,
+          "duplicate_file_bytes": 4095475712,
+          "duplicate_chunks": 999872,
+          "duplicate_chunk_bytes": 4095475712,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      },
+      {
+        "case": "changed",
+        "seconds": 8.487679172074422,
+        "cpu_seconds": 8.433195,
+        "peak_rss_kib": 9516,
+        "database_bytes": 609517568,
+        "stats": {
+          "database_batches": 977,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 1000000,
+          "files_hashed": 1,
+          "files_unchanged": 999999,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 4096,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 999871,
+          "duplicate_file_bytes": 4095471616,
+          "duplicate_chunks": 999871,
+          "duplicate_chunk_bytes": 4095471616,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        }
+      }
+    ]
+  },
+  "listing_samples": {
+    "before": {
+      "seconds": 29.28,
+      "user_seconds": 20.36,
+      "system_seconds": 8.82,
+      "peak_rss_kib": 9812,
+      "cpu_seconds": 29.18
+    },
+    "after": {
+      "seconds": 16.66,
+      "user_seconds": 8.91,
+      "system_seconds": 7.68,
+      "peak_rss_kib": 9480,
+      "cpu_seconds": 16.59
+    }
+  },
+  "commit_policy_control": {
+    "files": 100000,
+    "fixture": "First 100 directories from the same million-file fixture",
+    "method": "Three fresh indexes per policy, serial runs alternating order, same baseline executable with an explicit batch-size override; no other profiling job ran concurrently. OS cache warm, durable commits.",
+    "summary": {
+      "64": {
+        "seconds": {
+          "median": 56.57300867594313,
+          "min": 29.620735754957423,
+          "max": 113.9886614009738
+        },
+        "cpu_seconds": {
+          "median": 13.049534000000001,
+          "min": 12.185463,
+          "max": 16.118040999999998
+        },
+        "peak_rss_kib": {
+          "median": 8572,
+          "min": 8408,
+          "max": 8580
+        }
+      },
+      "1024": {
+        "seconds": {
+          "median": 12.621574021992274,
+          "min": 9.859921565046534,
+          "max": 26.882699899957515
+        },
+        "cpu_seconds": {
+          "median": 7.973674000000001,
+          "min": 7.863288000000001,
+          "max": 11.307188
+        },
+        "peak_rss_kib": {
+          "median": 8272,
+          "min": 8112,
+          "max": 8468
+        }
+      }
+    },
+    "samples": [
+      {
+        "seconds": 9.859921565046534,
+        "cpu_seconds": 7.973674000000001,
+        "peak_rss_kib": 8468,
+        "stats": {
+          "database_batches": 98,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 100000,
+          "files_hashed": 100000,
+          "files_unchanged": 0,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 409600000,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 99871,
+          "duplicate_file_bytes": 409071616,
+          "duplicate_chunks": 99871,
+          "duplicate_chunk_bytes": 409071616,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        },
+        "batch": 1024,
+        "repetition": 0
+      },
+      {
+        "seconds": 56.57300867594313,
+        "cpu_seconds": 13.049534000000001,
+        "peak_rss_kib": 8572,
+        "stats": {
+          "database_batches": 1563,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 100000,
+          "files_hashed": 100000,
+          "files_unchanged": 0,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 409600000,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 99871,
+          "duplicate_file_bytes": 409071616,
+          "duplicate_chunks": 99871,
+          "duplicate_chunk_bytes": 409071616,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        },
+        "batch": 64,
+        "repetition": 0
+      },
+      {
+        "seconds": 113.9886614009738,
+        "cpu_seconds": 16.118040999999998,
+        "peak_rss_kib": 8580,
+        "stats": {
+          "database_batches": 1564,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 100000,
+          "files_hashed": 100000,
+          "files_unchanged": 0,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 409600000,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 99871,
+          "duplicate_file_bytes": 409071616,
+          "duplicate_chunks": 99871,
+          "duplicate_chunk_bytes": 409071616,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        },
+        "batch": 64,
+        "repetition": 1
+      },
+      {
+        "seconds": 26.882699899957515,
+        "cpu_seconds": 11.307188,
+        "peak_rss_kib": 8112,
+        "stats": {
+          "database_batches": 99,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 100000,
+          "files_hashed": 100000,
+          "files_unchanged": 0,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 409600000,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 99871,
+          "duplicate_file_bytes": 409071616,
+          "duplicate_chunks": 99871,
+          "duplicate_chunk_bytes": 409071616,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        },
+        "batch": 1024,
+        "repetition": 1
+      },
+      {
+        "seconds": 12.621574021992274,
+        "cpu_seconds": 7.863288000000001,
+        "peak_rss_kib": 8272,
+        "stats": {
+          "database_batches": 98,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 100000,
+          "files_hashed": 100000,
+          "files_unchanged": 0,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 409600000,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 99871,
+          "duplicate_file_bytes": 409071616,
+          "duplicate_chunks": 99871,
+          "duplicate_chunk_bytes": 409071616,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        },
+        "batch": 1024,
+        "repetition": 2
+      },
+      {
+        "seconds": 29.620735754957423,
+        "cpu_seconds": 12.185463,
+        "peak_rss_kib": 8408,
+        "stats": {
+          "database_batches": 1563,
+          "btrfs_subvolumes": 0,
+          "btrfs_search_pages": 0,
+          "discovery_jobs": 0,
+          "chunks_reused": 0,
+          "scanner_fallbacks": [],
+          "files_seen": 100000,
+          "files_hashed": 100000,
+          "files_unchanged": 0,
+          "hardlinks_skipped": 0,
+          "files_removed": 0,
+          "bytes_hashed": 409600000,
+          "hole_bytes_skipped": 0,
+          "duplicate_files": 99871,
+          "duplicate_file_bytes": 409071616,
+          "duplicate_chunks": 99871,
+          "duplicate_chunk_bytes": 409071616,
+          "jobs_attempted": 0,
+          "jobs_completed": 0,
+          "bytes_deduped": 0,
+          "bytes_already_shared": 0,
+          "unsupported": 0,
+          "stale": 0,
+          "errors": []
+        },
+        "batch": 64,
+        "repetition": 2
+      }
+    ]
+  }
+}

@@ -1,7 +1,27 @@
 use anyhow::Result;
 use clap::Parser;
 use dedupit::{Granularity, Options, Scanner};
-use std::path::PathBuf;
+use std::{
+    borrow::Cow,
+    io::{self, BufWriter, Write},
+    path::PathBuf,
+};
+
+// Borrow report fields instead of allocating a JSON value tree (including
+// numeric arrays for both paths) for every range. Keep the existing key order.
+#[derive(serde::Serialize)]
+struct DuplicateRecord<'a> {
+    destination: Cow<'a, str>,
+    destination_offset: u64,
+    destination_path_bytes: &'a [u8],
+    length: u64,
+    source: Cow<'a, str>,
+    source_offset: u64,
+    source_path_bytes: &'a [u8],
+    #[serde(rename = "type")]
+    record_type: &'static str,
+    whole_file: bool,
+}
 
 #[derive(Parser)]
 #[command(
@@ -27,7 +47,7 @@ struct Cli {
     #[arg(long, value_enum, default_value = "auto")]
     scanner: Scanner,
     /// Operations per durable commit; unfinished batches are replayed after a crash.
-    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=4096))]
+    #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u16).range(1..=4096))]
     commit_batch_size: u16,
     /// Emit machine-readable run statistics.
     #[arg(long)]
@@ -52,23 +72,29 @@ fn main() -> Result<()> {
     };
     let stats = dedupit::run(&options, cli.apply)?;
     if cli.list {
+        let stdout = io::stdout();
+        let mut output = BufWriter::with_capacity(64 * 1024, stdout.lock());
         dedupit::list_duplicates(&options, |duplicate| {
             if cli.json {
                 use std::os::unix::ffi::OsStrExt;
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "type":"duplicate", "whole_file":duplicate.whole_file,
-                        "source":duplicate.source.to_string_lossy(),
-                        "source_path_bytes":duplicate.source.as_os_str().as_bytes(),
-                        "source_offset":duplicate.source_offset,
-                        "destination":duplicate.destination.to_string_lossy(),
-                        "destination_path_bytes":duplicate.destination.as_os_str().as_bytes(),
-                        "destination_offset":duplicate.destination_offset,"length":duplicate.length
-                    })
-                );
+                serde_json::to_writer(
+                    &mut output,
+                    &DuplicateRecord {
+                        destination: duplicate.destination.to_string_lossy(),
+                        destination_offset: duplicate.destination_offset,
+                        destination_path_bytes: duplicate.destination.as_os_str().as_bytes(),
+                        length: duplicate.length,
+                        source: duplicate.source.to_string_lossy(),
+                        source_offset: duplicate.source_offset,
+                        source_path_bytes: duplicate.source.as_os_str().as_bytes(),
+                        record_type: "duplicate",
+                        whole_file: duplicate.whole_file,
+                    },
+                )?;
+                writeln!(output)?;
             } else {
-                println!(
+                writeln!(
+                    output,
                     "{}: {:?}@{} -> {:?}@{} ({} bytes)",
                     if duplicate.whole_file {
                         "file"
@@ -80,10 +106,13 @@ fn main() -> Result<()> {
                     duplicate.destination,
                     duplicate.destination_offset,
                     duplicate.length
-                );
+                )?;
             }
             Ok(())
         })?;
+        // Reports precede the final stats record, including with redirected
+        // stdout; propagate write errors instead of silently losing a tail.
+        output.flush()?;
     }
     if cli.json {
         if cli.list {

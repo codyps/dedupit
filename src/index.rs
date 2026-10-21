@@ -270,6 +270,11 @@ impl Index {
             tx.pragma_update(None, "user_version", 3)?;
             tx.commit()?;
         }
+        // Directory reconciliation precedes file jobs. Without this index,
+        // finding each directory can walk all earlier queued regular files.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS discovery_kind ON discovery(crawl_id,directory,ino);",
+        )?;
         #[cfg(feature = "test-failpoints")]
         if std::env::var_os("DEDUPIT_TEST_SMALL_CACHE").is_some() {
             // Force uncommitted WAL spill in crash tests, not just lost in-memory rows.
@@ -443,38 +448,31 @@ impl Index {
     }
 
     pub fn list_duplicates(&self, visit: &mut impl FnMut(Duplicate) -> Result<()>) -> Result<()> {
-        let mut statement = self.conn.prepare_cached(
-            "SELECT f.path,r.offset,r.length,r.kind,r.hash FROM ranges r
-             JOIN files f ON f.id=r.file_id
-             JOIN (SELECT kind,hash,length FROM ranges GROUP BY kind,hash,length
-                   HAVING COUNT(*)>1) g
-             ON r.kind=g.kind AND r.hash=g.hash AND r.length=g.length
-             ORDER BY r.kind,r.hash,r.length,r.id",
-        )?;
-        let mut rows = statement.query([])?;
-        let mut representative: Option<(i64, Vec<u8>, u64, PathBuf, u64)> = None;
-        while let Some(row) = rows.next()? {
-            let path = decode_path(row.get(0)?);
-            let offset = row.get(1)?;
-            let length = row.get(2)?;
-            let kind = row.get(3)?;
-            let hash: Vec<u8> = row.get(4)?;
-            if let Some((previous_kind, previous_hash, previous_length, source, source_offset)) =
-                &representative
-            {
-                if kind == *previous_kind && hash == *previous_hash && length == *previous_length {
-                    visit(Duplicate {
-                        source: source.clone(),
-                        source_offset: *source_offset,
-                        destination: path,
-                        destination_offset: offset,
-                        length,
-                        whole_file: kind == 1,
-                    })?;
-                    continue;
-                }
+        // Stream duplicate groups from the covering matches index, then seek
+        // each group's ranges in ID order. Joining all groups in one statement
+        // made SQLite sort every matching path before yielding any output.
+        // Singleton groups never need a file/path lookup.
+        let mut groups = self.conn.prepare_cached(DUPLICATE_GROUPS)?;
+        let mut candidates = self.conn.prepare_cached(DUPLICATE_RANGES)?;
+        let mut groups = groups.query([])?;
+        while let Some(group) = groups.next()? {
+            let kind: i64 = group.get(0)?;
+            let hash: Vec<u8> = group.get(1)?;
+            let length: u64 = group.get(2)?;
+            let mut rows = candidates.query(params![kind, hash, length])?;
+            let Some(first) = rows.next()? else { continue };
+            let source = decode_path(first.get(0)?);
+            let source_offset = first.get(1)?;
+            while let Some(row) = rows.next()? {
+                visit(Duplicate {
+                    source: source.clone(),
+                    source_offset,
+                    destination: decode_path(row.get(0)?),
+                    destination_offset: row.get(1)?,
+                    length,
+                    whole_file: kind == 1,
+                })?;
             }
-            representative = Some((kind, hash, length, path, offset));
         }
         Ok(())
     }
@@ -705,6 +703,11 @@ fn ranges_overlap(a: u64, b: u64, length: u64) -> bool {
     a.abs_diff(b) < length
 }
 
+const DUPLICATE_GROUPS: &str = "SELECT kind,hash,length FROM ranges
+    GROUP BY kind,hash,length HAVING COUNT(*)>1 ORDER BY kind,hash,length";
+const DUPLICATE_RANGES: &str = "SELECT f.path,r.offset FROM ranges r
+    JOIN files f ON f.id=r.file_id WHERE r.kind=?1 AND r.hash=?2 AND r.length=?3 ORDER BY r.id";
+
 const JOB_SELECT: &str = "SELECT r.id,r.file_id,r.kind,r.offset,r.length,r.hash,
     f.path,f.fingerprint,f.fskey,f.alignment FROM ranges r JOIN files f ON f.id=r.file_id";
 
@@ -760,5 +763,48 @@ impl Job {
             bail!("indexed range is outside the file");
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::StatementStatus;
+
+    #[test]
+    fn listing_uses_index_order_without_sorting_paths() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path BLOB);
+             CREATE TABLE ranges (id INTEGER PRIMARY KEY, file_id INTEGER,
+               kind INTEGER, hash BLOB, length INTEGER, offset INTEGER);
+             CREATE INDEX matches ON ranges(kind,hash,length,id); BEGIN;",
+        )
+        .unwrap();
+        for id in 1..=4000 {
+            conn.execute_cached("INSERT INTO files VALUES (?1,?2)", params![id, b"path"])
+                .unwrap();
+            conn.execute_cached(
+                "INSERT INTO ranges VALUES (?1,?1,?2,?3,4096,0)",
+                params![id, id % 2, (id / 4i32).to_le_bytes()],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        let mut groups = conn.prepare_cached(DUPLICATE_GROUPS).unwrap();
+        let mut candidates = conn.prepare_cached(DUPLICATE_RANGES).unwrap();
+        {
+            let mut rows = groups.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let kind: i64 = row.get(0).unwrap();
+                let hash: Vec<u8> = row.get(1).unwrap();
+                let length: u64 = row.get(2).unwrap();
+                let mut matches = candidates.query(params![kind, hash, length]).unwrap();
+                while matches.next().unwrap().is_some() {}
+            }
+        }
+        assert_eq!(groups.get_status(StatementStatus::Sort), 0);
+        assert_eq!(candidates.get_status(StatementStatus::Sort), 0);
+        assert_eq!(candidates.get_status(StatementStatus::FullscanStep), 0);
     }
 }

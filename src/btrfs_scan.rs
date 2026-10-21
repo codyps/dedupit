@@ -336,9 +336,11 @@ fn process(
     )?;
     for directory in [true, false] {
         index.conn.execute_cached("DELETE FROM attempted", [])?;
+        let mut lower = i64::MIN;
         loop {
-            let ino:Option<i64>=index.conn.query_row_cached("SELECT ino FROM discovery WHERE crawl_id=?1 AND directory=?2 AND ino NOT IN (SELECT ino FROM attempted) ORDER BY ino LIMIT 1",params![crawl.id,directory],|r|r.get(0)).optional()?;
-            let Some(ino) = ino else { break };
+            let Some(ino) = next_queued(&index.conn, crawl.id, directory, &mut lower)? else {
+                break;
+            };
             index
                 .conn
                 .execute_cached("INSERT INTO attempted VALUES (?1)", [ino])?;
@@ -397,6 +399,37 @@ fn process(
         index.flush_batch()?;
     }
     Ok(())
+}
+
+const NEXT_QUEUED: &str = "SELECT ino FROM discovery WHERE crawl_id=?1 AND directory=?2
+    AND ino>=?3 AND ino NOT IN (SELECT ino FROM attempted) ORDER BY ino LIMIT 1";
+
+fn next_queued(
+    conn: &rusqlite::Connection,
+    crawl: i64,
+    directory: bool,
+    lower: &mut i64,
+) -> Result<Option<i64>> {
+    loop {
+        let ino = conn
+            .query_row_cached(NEXT_QUEUED, params![crawl, directory, *lower], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?;
+        if let Some(ino) = ino {
+            // Use SQLite's signed bounds without overflowing at MAX.
+            // attempted excludes MAX if advancing wraps to MIN.
+            *lower = ino.checked_add(1).unwrap_or(i64::MIN);
+            return Ok(Some(ino));
+        }
+        if *lower == i64::MIN {
+            return Ok(None);
+        }
+        // A directory job may enqueue a lower-numbered inode. Revisit that
+        // prefix after the forward pass; attempted prevents retry loops and
+        // keeps failing jobs from being visited more than once this invocation.
+        *lower = i64::MIN;
+    }
 }
 
 fn in_scope(path: &Path, roots: &[PathBuf]) -> bool {
@@ -572,31 +605,41 @@ fn directory_job(
         meta.is_dir() && meta.ino() == ino,
         "directory path changed identity"
     );
-    let names = fs::read_dir(&path)?
-        .map(|entry| entry.map(|e| e.file_name()))
-        .collect::<std::io::Result<HashSet<_>>>()?;
     // Deleted inodes have no tree item. A changed parent directory is the
     // evidence for looking up its former children and pruning deleted names.
-    let files:Vec<(u64,Vec<u8>)>=index.conn.prepare_cached("SELECT b.ino,f.path FROM btrfs_files b JOIN files f ON f.id=b.file_id WHERE b.crawl_id=?1 AND b.parent=?2")?.query_map(params![crawl.id,path_bytes(&path)],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-    for (child, bytes) in files {
+    // These cursors read only files/btrfs_dirs while queue writes discovery.
+    // Streaming avoids retaining a second copy of a wide directory's paths.
+    let mut files = index.conn.prepare_cached("SELECT b.ino,f.path FROM btrfs_files b JOIN files f ON f.id=b.file_id WHERE b.crawl_id=?1 AND b.parent=?2")?;
+    let mut files = files.query(params![crawl.id, path_bytes(&path)])?;
+    let mut names = None;
+    while let Some(row) = files.next()? {
+        // Initial discovery has no indexed children. Do not enumerate and
+        // retain all names merely to compare against an empty baseline.
+        if names.is_none() {
+            names = Some(
+                fs::read_dir(&path)?
+                    .map(|entry| entry.map(|e| e.file_name()))
+                    .collect::<std::io::Result<HashSet<_>>>()?,
+            );
+        }
+        let child: u64 = row.get(0)?;
+        let bytes = row.get(1)?;
         let child_path = decode_path(bytes);
         if child_path
             .file_name()
-            .is_none_or(|name| !names.contains(name))
+            .is_none_or(|name| !names.as_ref().unwrap().contains(name))
         {
             queue(index, crawl.id, child, false)?;
         }
     }
-    let dirs: Vec<(u64, Vec<u8>)> = index
-        .conn
-        .prepare_cached(
-            "SELECT ino,path FROM btrfs_dirs WHERE crawl_id=?1 AND parent=?2 AND ino!=?3",
-        )?
-        .query_map(params![crawl.id, path_bytes(&path), ino], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    for (child, bytes) in dirs {
+    let mut dirs = index.conn.prepare_cached(
+        "SELECT ino,path FROM btrfs_dirs WHERE crawl_id=?1 AND parent=?2 AND ino!=?3",
+    )?;
+    let dirs = dirs.query_map(params![crawl.id, path_bytes(&path), ino], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })?;
+    for entry in dirs {
+        let (child, bytes): (u64, Vec<u8>) = entry?;
         let child_path = decode_path(bytes);
         let matches = fs::symlink_metadata(&child_path)
             .is_ok_and(|meta| meta.is_dir() && meta.ino() == child);
@@ -853,6 +896,120 @@ mod tests {
         fresh.verify = true;
         crate::run(&fresh, false).unwrap();
         assert_eq!(whole(options), whole(&fresh));
+    }
+
+    #[test]
+    fn queue_seeks_past_failed_jobs_without_quadratic_rescans() {
+        use rusqlite::StatementStatus;
+        let (_dir, options, source, _) = setup(Granularity::Both);
+        let (index, crawl) = open(&options, &source);
+        index
+            .conn
+            .execute_batch("CREATE TEMP TABLE attempted (ino INTEGER PRIMARY KEY); BEGIN;")
+            .unwrap();
+        // Retain every job, simulating persistent failures. Interleave file
+        // jobs to ensure selecting directories uses the kind/ino index too.
+        let count = 20_000;
+        for ino in 0..count {
+            queue(&index, crawl.id, ino * 2, false).unwrap();
+            queue(&index, crawl.id, ino * 2 + 1, true).unwrap();
+        }
+        index.conn.execute_batch("COMMIT").unwrap();
+        let mut lower = i64::MIN;
+        for ino in 0..count {
+            assert_eq!(
+                next_queued(&index.conn, crawl.id, true, &mut lower).unwrap(),
+                Some((ino * 2 + 1) as i64)
+            );
+            index
+                .conn
+                .execute_cached("INSERT INTO attempted VALUES (?1)", [(ino * 2 + 1) as i64])
+                .unwrap();
+        }
+        assert_eq!(
+            next_queued(&index.conn, crawl.id, true, &mut lower).unwrap(),
+            None
+        );
+        let statement = index.conn.prepare_cached(NEXT_QUEUED).unwrap();
+        // Count actual SQLite VM work rather than timing a fast machine. This
+        // includes the final wrap over failed jobs; growth must stay linear.
+        assert!(statement.get_status(StatementStatus::VmStep) < count as i32 * 100);
+        assert_eq!(statement.get_status(StatementStatus::Sort), 0);
+        assert_eq!(statement.get_status(StatementStatus::FullscanStep), 0);
+    }
+
+    #[test]
+    fn queue_wraps_for_new_earlier_jobs_and_retries_failures_on_restart() {
+        let (_dir, options, source, _) = setup(Granularity::Both);
+        let (index, crawl) = open(&options, &source);
+        index
+            .conn
+            .execute_batch("CREATE TEMP TABLE attempted (ino INTEGER PRIMARY KEY);")
+            .unwrap();
+        for ino in [5, 10] {
+            queue(&index, crawl.id, ino, true).unwrap();
+        }
+        let mut lower = i64::MIN;
+        assert_eq!(
+            next_queued(&index.conn, crawl.id, true, &mut lower).unwrap(),
+            Some(5)
+        );
+        index
+            .conn
+            .execute("INSERT INTO attempted VALUES (5)", [])
+            .unwrap();
+        queue(&index, crawl.id, 2, true).unwrap();
+        assert_eq!(
+            next_queued(&index.conn, crawl.id, true, &mut lower).unwrap(),
+            Some(10)
+        );
+        index
+            .conn
+            .execute("DELETE FROM discovery WHERE ino=10", [])
+            .unwrap();
+        assert_eq!(
+            next_queued(&index.conn, crawl.id, true, &mut lower).unwrap(),
+            Some(2)
+        );
+        index
+            .conn
+            .execute("DELETE FROM discovery WHERE ino=2", [])
+            .unwrap();
+        assert_eq!(
+            next_queued(&index.conn, crawl.id, true, &mut lower).unwrap(),
+            None
+        );
+        index.conn.execute("DELETE FROM attempted", []).unwrap();
+        assert_eq!(
+            next_queued(&index.conn, crawl.id, true, &mut lower).unwrap(),
+            Some(5)
+        );
+        index.conn.execute("DELETE FROM discovery", []).unwrap();
+        index.conn.execute("DELETE FROM attempted", []).unwrap();
+        for ino in [i64::MIN, i64::MAX] {
+            index
+                .conn
+                .execute(
+                    "INSERT INTO discovery VALUES (?1,?2,1)",
+                    params![crawl.id, ino],
+                )
+                .unwrap();
+        }
+        lower = i64::MIN;
+        for ino in [i64::MIN, i64::MAX] {
+            assert_eq!(
+                next_queued(&index.conn, crawl.id, true, &mut lower).unwrap(),
+                Some(ino)
+            );
+            index
+                .conn
+                .execute("INSERT INTO attempted VALUES (?1)", [ino])
+                .unwrap();
+        }
+        assert_eq!(
+            next_queued(&index.conn, crawl.id, true, &mut lower).unwrap(),
+            None
+        );
     }
 
     #[test]

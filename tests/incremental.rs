@@ -505,6 +505,8 @@ fn duplicate_list_streams_representatives_and_offsets() {
     let (_dir, options) = setup(Granularity::Both);
     put(&options, "a", &vec![1; 4096]);
     put(&options, "b", &vec![1; 4096]);
+    put(&options, "unique", &vec![2; 4096]);
+    put(&options, "unique-tail", &vec![3; 2048]);
     run(&options, false).unwrap();
     let mut files = 0;
     let mut chunks = 0;
