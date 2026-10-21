@@ -89,8 +89,8 @@ updates. A batched metadata search then confirms only inode items whose size,
 mtime, ctime and incarnation still match the indexed file. The same discovery batches durably queue unrelated inode and directory changes
 before advancing their cursors or generation boundary.
 
-A successful apply therefore needs no destination reopening or mapping refresh
-on the next invocation. After a crash, startup queues every unconfirmed mapping.
+After successful mapping confirmation, an otherwise idle invocation needs no
+destination reopening or mapping refresh. After a crash, startup queues every unconfirmed mapping.
 Unchanged files refresh their maps without reading contents or losing committed
 completions when the maps still match. A mismatched provisional map requeues
 sharing jobs without rereading unchanged contents; changed files are fully rehashed because the
@@ -399,6 +399,26 @@ are single samples. Peak application RSS was 9.5 MiB, with a 686 MiB native inde
 after reconciliation. All 1,000,003 final files passed byte checks, original inode
 identities were preserved, and the index matched a fresh full scan. These are VM
 measurements with the conditions and every sample retained in the JSON record.
+
+The earlier native record predates mapping capture during apply. The
+[updated million-file run](benchmarks/native-btrfs-apply-cache-million-files.json)
+confirmed 999,870 destination mappings during `--apply`. Its very first following
+invocation took **148 ms**, with **zero file opens, content reads, or sharing
+jobs**, replacing the earlier 43.9-second refresh. Subsequent idle applies had a
+113 ms median. All 1,000,003 final files passed byte/inode checks and matched a
+fresh full scan; each 4 KiB write in the shared 8 MiB control still reused 63 of
+64 cached chunks. The native index occupied 652 MiB; peak native CLI RSS was
+9.5 MiB.
+
+Initial apply took 242.7 seconds, including map capture, filesystem commit and
+batched discovery acknowledgement. Apply plus its first follow-up therefore
+totaled **242.9 seconds**, versus **200.3 seconds** in the earlier record. These
+separate hosted runs do not establish a throughput improvement: unaffected
+initial indexing and fresh full scans also differed substantially between hosts.
+The JSON retains both totals and every sample rather than presenting the removed
+refresh as free work. The benchmark workflow's `compare_baseline=true` option
+runs the earlier baseline and current build sequentially on one host, in fresh
+VMs with the same resources and fixture model, for a more useful comparison.
 
 ## Validation
 
