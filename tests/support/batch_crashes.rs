@@ -58,7 +58,8 @@ fn durable_state(database: &Path) -> (Value, blake3::Hash) {
     };
     let counts = serde_json::json!({"files":count("files"), "completed":count("completed"),
         "ranges":count("ranges"), "discovery":count("discovery"), "apply_mappings":count("apply_mappings"),
-        "unconfirmed":count("apply_mappings")});
+        "unconfirmed":count("apply_mappings"),
+        "unconfirmed_completions":conn.query_row("SELECT COUNT(*) FROM completed c JOIN ranges r ON r.id=c.target JOIN apply_mappings a ON a.file_id=r.file_id", [], |r| r.get::<_, u64>(0)).unwrap()});
     let mut hash = blake3::Hasher::new();
     for table in [
         "files",
@@ -544,7 +545,18 @@ fn apply_mapping_cache_recovers_before_and_after_filesystem_confirmation() {
             if downtime_write {
                 assert!(resumed["bytes_hashed"].as_u64().unwrap() > 0);
             } else {
-                assert_eq!(resumed["jobs_completed"].as_u64().unwrap(), 129 - durable);
+                let jobs = resumed["jobs_completed"].as_u64().unwrap();
+                let uncertain = observation.durable["unconfirmed_completions"]
+                    .as_u64()
+                    .unwrap();
+                // A commit/fsync may change a provisional descriptor (notably
+                // compressed partial extents on Linux 6.8). Only completions
+                // whose maps were still provisional may need revalidation.
+                assert!(
+                    (129 - durable..=129 - durable + uncertain).contains(&jobs),
+                    "{resumed}"
+                );
+                assert_eq!(resumed["bytes_hashed"], 0);
             }
         }
         // A write after recovery must still be discovered. Changing the original
