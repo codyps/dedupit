@@ -1,6 +1,6 @@
 use crate::{
     backend,
-    index::{path_bytes, Index},
+    index::{path_bytes, Index, SqlCache},
     Granularity, Options, Stats,
 };
 use anyhow::{ensure, Context, Result};
@@ -34,11 +34,97 @@ pub(crate) fn fingerprint(meta: &Metadata) -> Vec<u8> {
     .collect()
 }
 
-/// Open each path component relative to an already opened directory, without
-/// following symlinks. O_NONBLOCK prevents a raced replacement by a FIFO from
+/// Open without following symlinks in any path component. O_NONBLOCK prevents
+/// a raced replacement by a FIFO from
 /// hanging the process; fstat rejects all non-regular leaf objects.
 pub(crate) fn open_regular(path: &Path, write: bool) -> io::Result<File> {
-    let components: Vec<_> = path.components().collect();
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a normalized absolute path",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(file) = open_regular_linux(path, write)? {
+        return Ok(file);
+    }
+    open_regular_components(path, write)
+}
+
+/// Resolve all components in one syscall with the same no-symlink guarantee as
+/// the component walk. Older kernels, syscall filters and long paths retain
+/// the portable walk. No directory-descriptor cache can hide renamed ancestors.
+#[cfg(target_os = "linux")]
+fn open_regular_linux(path: &Path, write: bool) -> io::Result<Option<File>> {
+    let bytes = path.as_os_str().as_bytes();
+    let mut name = [0; 4096];
+    if bytes.len() >= name.len() {
+        return Ok(None);
+    }
+    name[..bytes.len()].copy_from_slice(bytes);
+    let name = std::ffi::CStr::from_bytes_with_nul(&name[..=bytes.len()])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: open_how is a C struct of integers; all-zero is its required
+    // initial state, including any padding/future fields.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = ((if write { libc::O_RDWR } else { libc::O_RDONLY })
+        | libc::O_CLOEXEC
+        | libc::O_NOFOLLOW
+        | libc::O_NONBLOCK
+        | libc::O_NOATIME) as u64;
+    how.resolve = libc::RESOLVE_NO_SYMLINKS;
+    loop {
+        // SAFETY: name is NUL-terminated; how is fully initialized with no
+        // creation flags and its exact ABI size. AT_FDCWD ignores cwd for this
+        // absolute path; NO_SYMLINKS applies to every component, not just leaf.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                libc::AT_FDCWD,
+                name.as_ptr(),
+                &how as *const libc::open_how,
+                std::mem::size_of::<libc::open_how>(),
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: openat2 returned a new owned fd, representable as c_int.
+            let file = unsafe { File::from_raw_fd(fd as libc::c_int) };
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                ));
+            }
+            return Ok(Some(file));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EPERM) && how.flags & libc::O_NOATIME as u64 != 0 {
+            how.flags &= !(libc::O_NOATIME as u64);
+            continue;
+        }
+        return if error.raw_os_error().is_some_and(|code| {
+            [
+                libc::ENOSYS,
+                libc::EINVAL,
+                libc::E2BIG,
+                libc::EPERM,
+                libc::ENAMETOOLONG,
+            ]
+            .contains(&code)
+        }) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+}
+
+fn open_regular_components(path: &Path, write: bool) -> io::Result<File> {
+    let mut components = path.components().peekable();
     if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -49,7 +135,8 @@ pub(crate) fn open_regular(path: &Path, write: bool) -> io::Result<File> {
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open("/")?;
-    for (i, component) in components.iter().enumerate() {
+    let mut inline_name = [0; 256];
+    while let Some(component) = components.next() {
         let Component::Normal(name) = component else {
             if matches!(component, Component::RootDir) {
                 continue;
@@ -59,8 +146,21 @@ pub(crate) fn open_regular(path: &Path, write: bool) -> io::Result<File> {
                 "non-normal path component",
             ));
         };
-        let name = std::ffi::CString::new(name.as_bytes())?;
-        let last = i == components.len() - 1;
+        let bytes = name.as_bytes();
+        let heap_name;
+        // Most Unix names fit in NAME_MAX=255. Retain an allocating fallback
+        // for filesystems with longer components, and reject interior NULs in
+        // either case. Never follow a symlink to save path-opening work.
+        let name = if bytes.len() < inline_name.len() {
+            inline_name[..bytes.len()].copy_from_slice(bytes);
+            inline_name[bytes.len()] = 0;
+            std::ffi::CStr::from_bytes_with_nul(&inline_name[..=bytes.len()])
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+        } else {
+            heap_name = std::ffi::CString::new(bytes)?;
+            &heap_name
+        };
+        let last = components.peek().is_none();
         let access = if last && write {
             libc::O_RDWR
         } else {
@@ -205,7 +305,7 @@ pub(crate) fn index_file(
     if excluded_ids.contains(&(before.dev(), before.ino())) {
         return Ok(());
     }
-    let existing: Option<(i64, Vec<u8>, Vec<u8>, bool)> = index.conn.query_row(
+    let existing: Option<(i64, Vec<u8>, Vec<u8>, bool)> = index.conn.query_row_cached(
         "SELECT id,fingerprint,path,EXISTS(SELECT 1 FROM seen WHERE file_id=files.id) FROM files WHERE dev=?1 AND ino=?2",
         params![before.dev() as i64, before.ino() as i64],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?)),
@@ -216,10 +316,10 @@ pub(crate) fn index_file(
             return Ok(());
         }
     }
-    let baseline: Option<Vec<u8>> = if let Some((id, ..)) = &existing {
+    let baseline: Option<Vec<u8>> = if let (Some((id, ..)), Some(_)) = (&existing, native) {
         index
             .conn
-            .query_row(
+            .query_row_cached(
                 "SELECT incarnation FROM extent_state WHERE file_id=?1",
                 [id],
                 |r| r.get(0),
@@ -237,7 +337,9 @@ pub(crate) fn index_file(
             && (native.is_none() || reusable)
         {
             // TEMP storage avoids a durable update/fsync per unchanged file.
-            index.conn.execute("INSERT INTO seen VALUES (?1)", [id])?;
+            index
+                .conn
+                .execute_cached("INSERT INTO seen VALUES (?1)", [id])?;
             if let Some(view) = native {
                 let tx = index.conn.transaction()?;
                 store_extents(&tx, *id, view)?;
@@ -250,17 +352,17 @@ pub(crate) fn index_file(
     let tx = index.conn.transaction()?;
     // A name may now refer to a different inode. Invalidate it atomically with
     // insertion/rename of the current inode's row.
-    tx.execute(
+    tx.execute_cached(
         "DELETE FROM files WHERE path=?1 AND (dev!=?2 OR ino!=?3)",
         params![path_bytes(path), before.dev() as i64, before.ino() as i64],
     )?;
     if let Some((id, previous, _, _)) = existing.as_ref() {
         if !options.verify && version == *previous && native.is_none() {
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE files SET path=?1 WHERE id=?2",
                 params![path_bytes(path), id],
             )?;
-            tx.execute("INSERT INTO seen VALUES (?1)", [id])?;
+            tx.execute_cached("INSERT INTO seen VALUES (?1)", [id])?;
             tx.commit()?;
             stats.files_unchanged += 1;
             return Ok(());
@@ -271,17 +373,17 @@ pub(crate) fn index_file(
         .as_ref()
         .map(|(_, fp, ..)| u64::from_le_bytes(fp[16..24].try_into().unwrap()));
     let file_id = if let Some((id, _, _, _)) = existing {
-        tx.execute(
+        tx.execute_cached(
             "UPDATE files SET path=?1,fingerprint=?2,fskey=?3,alignment=?4 WHERE id=?5",
             params![path_bytes(path), version, fs.key, fs.alignment, id],
         )?;
         id
     } else {
-        tx.execute("INSERT INTO files(path,dev,ino,fingerprint,fskey,alignment) VALUES (?1,?2,?3,?4,?5,?6)",
+        tx.execute_cached("INSERT INTO files(path,dev,ino,fingerprint,fskey,alignment) VALUES (?1,?2,?3,?4,?5,?6)",
             params![path_bytes(path), before.dev() as i64, before.ino() as i64, version, fs.key, fs.alignment])?;
         tx.last_insert_rowid()
     };
-    tx.execute("INSERT INTO seen VALUES (?1)", [file_id])?;
+    tx.execute_cached("INSERT INTO seen VALUES (?1)", [file_id])?;
     let full = !reusable || native.is_none_or(|view| !view.cow);
     let dirty = if full {
         if before.len() == 0 {
@@ -290,7 +392,7 @@ pub(crate) fn index_file(
             vec![(0, before.len())]
         }
     } else {
-        let mut statement = tx.prepare(
+        let mut statement = tx.prepare_cached(
             "SELECT offset,length,descriptor FROM file_extents WHERE file_id=?1 ORDER BY offset",
         )?;
         let old = statement
@@ -311,37 +413,47 @@ pub(crate) fn index_file(
         )
     };
     if full {
-        tx.execute("DELETE FROM ranges WHERE file_id=?1", [file_id])?;
-        tx.execute("DELETE FROM chunk_cache WHERE file_id=?1", [file_id])?;
+        tx.execute_cached("DELETE FROM ranges WHERE file_id=?1", [file_id])?;
+        tx.execute_cached("DELETE FROM chunk_cache WHERE file_id=?1", [file_id])?;
     } else {
         for (start, end) in &dirty {
-            tx.execute(
+            tx.execute_cached(
                 "DELETE FROM ranges WHERE file_id=?1 AND kind=0 AND offset>=?2 AND offset<?3",
                 params![file_id, start, end],
             )?;
-            tx.execute(
+            tx.execute_cached(
                 "DELETE FROM chunk_cache WHERE file_id=?1 AND offset>=?2 AND offset<?3",
                 params![file_id, start, end],
             )?;
         }
-        tx.execute(
+        tx.execute_cached(
             "DELETE FROM ranges WHERE file_id=?1 AND kind=0 AND offset>=?2",
             params![file_id, before.len()],
         )?;
-        tx.execute(
+        tx.execute_cached(
             "DELETE FROM chunk_cache WHERE file_id=?1 AND offset>=?2",
             params![file_id, before.len()],
         )?;
-        stats.chunks_reused += tx.query_row(
+        stats.chunks_reused += tx.query_row_cached(
             "SELECT COUNT(*) FROM chunk_cache WHERE file_id=?1",
             [file_id],
             |r| r.get::<_, u64>(0),
         )?;
         if !dirty.is_empty() || old_size != Some(before.len()) {
-            tx.execute("DELETE FROM ranges WHERE file_id=?1 AND kind=1", [file_id])?;
+            tx.execute_cached("DELETE FROM ranges WHERE file_id=?1 AND kind=1", [file_id])?;
         }
     }
-    let mut buffer = vec![0; options.chunk_size];
+    // One lazily grown scratch buffer per run, shared by portable and native
+    // scans. Small/empty files and metadata-only changes need no full-size
+    // allocation, and unchanged files never touch the buffer.
+    let buffer = &mut index.buffer;
+    if !dirty.is_empty() {
+        let needed = before.len().min(options.chunk_size as u64) as usize;
+        if buffer.len() < needed {
+            buffer.reserve_exact(needed - buffer.len());
+            buffer.resize(needed, 0);
+        }
+    }
     let mut sparse_supported = true;
     let mut insert = tx.prepare_cached(
         "INSERT INTO ranges(file_id,kind,offset,length,hash) VALUES (?1,?2,?3,?4,?5)",
@@ -415,12 +527,12 @@ pub(crate) fn index_file(
     {
         let mut whole = blake3::Hasher::new_derive_key("dedupit whole-file chunk tree v1");
         whole.update(&before.len().to_le_bytes());
-        let mut statement=tx.prepare("SELECT offset,length,hash FROM chunk_cache WHERE file_id=?1 AND nonzero=1 ORDER BY offset")?;
+        let mut statement=tx.prepare_cached("SELECT offset,length,hash FROM chunk_cache WHERE file_id=?1 AND nonzero=1 ORDER BY offset")?;
         let mut rows = statement.query([file_id])?;
         while let Some(row) = rows.next()? {
             whole.update(&row.get::<_, u64>(0)?.to_le_bytes());
             whole.update(&row.get::<_, u64>(1)?.to_le_bytes());
-            whole.update(&row.get::<_, Vec<u8>>(2)?);
+            whole.update(row.get_ref(2)?.as_blob()?);
         }
         insert.execute(params![
             file_id,
@@ -434,8 +546,8 @@ pub(crate) fn index_file(
     if let Some(view) = native {
         store_extents(&tx, file_id, view)?;
     } else {
-        tx.execute("DELETE FROM extent_state WHERE file_id=?1", [file_id])?;
-        tx.execute("DELETE FROM file_extents WHERE file_id=?1", [file_id])?;
+        tx.execute_cached("DELETE FROM extent_state WHERE file_id=?1", [file_id])?;
+        tx.execute_cached("DELETE FROM file_extents WHERE file_id=?1", [file_id])?;
     }
     ensure!(
         fingerprint(&file.metadata()?) == version,
@@ -459,14 +571,14 @@ pub(crate) fn index_file(
 }
 
 fn store_extents(tx: &rusqlite::Transaction<'_>, file_id: i64, view: &NativeView) -> Result<()> {
-    tx.execute("DELETE FROM file_extents WHERE file_id=?1", [file_id])?;
+    tx.execute_cached("DELETE FROM file_extents WHERE file_id=?1", [file_id])?;
     for extent in &view.extents {
-        tx.execute(
+        tx.execute_cached(
             "INSERT INTO file_extents VALUES (?1,?2,?3,?4)",
             params![file_id, extent.offset, extent.length, extent.descriptor],
         )?;
     }
-    tx.execute(
+    tx.execute_cached(
         "INSERT OR REPLACE INTO extent_state VALUES (?1,?2)",
         params![file_id, view.incarnation],
     )?;
@@ -579,5 +691,61 @@ fn next_data(file: &File, offset: u64) -> io::Result<Option<u64>> {
     {
         let _ = (file, offset);
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::{ffi::OsStringExt, fs::symlink};
+
+    #[test]
+    fn guarded_opens_preserve_identity_and_reject_symlinks_and_special_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let directory = root.join("directory");
+        fs::create_dir(&directory).unwrap();
+        let leaf = directory.join(std::ffi::OsString::from_vec(vec![b'x', 0xff]));
+        fs::write(&leaf, b"contents").unwrap();
+        let long = directory.join("x".repeat(255));
+        fs::write(&long, b"long name").unwrap();
+        let leaf_link = directory.join("leaf-link");
+        symlink(&leaf, &leaf_link).unwrap();
+        let parent_link = root.join("parent-link");
+        symlink(&directory, &parent_link).unwrap();
+        let fifo = directory.join("fifo");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: live NUL-terminated path and valid permissions, no pointer retention.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+
+        // Exercise the portable fallback directly even on kernels with openat2.
+        for open in [open_regular, open_regular_components] {
+            for write in [false, true] {
+                for path in [&leaf, &long] {
+                    let file = open(path, write).unwrap();
+                    assert_eq!(
+                        file.metadata().unwrap().ino(),
+                        fs::metadata(path).unwrap().ino()
+                    );
+                }
+                for path in [
+                    &directory,
+                    &fifo,
+                    &leaf_link,
+                    &parent_link.join(leaf.file_name().unwrap()),
+                ] {
+                    assert!(open(path, write).is_err(), "opened {path:?}");
+                }
+            }
+            assert!(open(
+                &directory
+                    .join("../directory")
+                    .join(leaf.file_name().unwrap()),
+                false
+            )
+            .is_err());
+            assert!(open(Path::new("relative"), false).is_err());
+            assert!(open(&directory.join("nul\0name"), false).is_err());
+        }
     }
 }

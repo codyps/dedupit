@@ -155,7 +155,7 @@ The portable fallback works as follows:
 Every **portable** run still walks directory entries and reads metadata: generic Unix APIs
 do not supply a persistent, portable change journal. Incrementality saves
 content reads and repeated sharing operations, not traversal. Content reads use
-a bounded chunk buffer; native mapping comparisons use memory proportional to
+a lazily allocated chunk buffer reused across files; native mapping comparisons use memory proportional to
 the extent count of the changed file. Duplicate listings stream.
 
 ## Native sharing and correctness
@@ -227,6 +227,43 @@ The filesystem may reject sharing for read-only snapshots, incompatible inode
 flags, swap files, encryption, block alignment, or other native restrictions.
 No destructive fallback is attempted. Indexes should be kept in a trusted
 directory; the process has the privileges of its invoking user.
+
+## Profiling
+
+`tools/profile.py` compares optimized binaries on reproducible disposable data.
+It measures initial scans, unchanged scans, a single changed file, and a dense
+64 MiB file with 4 KiB chunks. `--apply` adds native sharing of 2,500 small files
+and an unchanged apply restart. Setup/indexing time is excluded from apply time;
+each repetition rewrites destinations to break sharing from previous runs.
+The harness checks range inventories across binaries and file bytes after apply.
+
+```sh
+# Save an optimized baseline binary before making changes, then build again.
+CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release --locked
+python3 tools/profile.py --binary /path/to/before --binary target/release/dedupit \
+  --directory target/profile-comparison --repetitions 5 --apply
+```
+
+Requires Python 3.9+ and GNU `time` (`--time /path/to/time` if needed). The
+directory must be new and on the filesystem being measured; `--apply` needs
+native sharing support. Results include every sample's wall time, CPU time,
+peak RSS, and application statistics in `results.json`. Binary order alternates
+between repetitions. Data is warm in the page cache, so these results measure
+processing and commit costs rather than cold-device read throughput. Privileged
+btrfs generation discovery is covered by the QEMU correctness/stress suite;
+this benchmark selects portable discovery explicitly.
+
+CPU profiles of unchanged scans identified repeated SQL preparation as a major
+cost. Heap profiles identified per-component path strings, per-file chunk
+buffers, and per-chunk copies of cached hashes. Scan and apply statements now
+use a bounded prepared-statement cache; hashing reuses scratch storage and reads
+cached hashes directly. Linux uses `openat2` with
+[`RESOLVE_NO_SYMLINKS`](https://man7.org/linux/man-pages/man2/openat2.2.html)
+to validate every path component in one call where supported, retaining the
+component-by-component fallback. Durable per-file/per-job commits and identity
+validation remain in place. Initial scans and apply can still be dominated by
+filesystem sync latency; hashing and index insertion dominate dense small-chunk
+scans. Use CPU/heap profilers separately from wall-time benchmarks.
 
 ## Validation
 

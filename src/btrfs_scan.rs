@@ -3,7 +3,7 @@
 //! stable hashing or a confirmed deletion/out-of-scope observation.
 use crate::{
     btrfs_io::{self as io, Inode, Item, Key},
-    index::{decode_path, path_bytes, Index},
+    index::{decode_path, path_bytes, Index, SqlCache},
     scan::{self, Extent, NativeView},
     Options, Scanner, Stats,
 };
@@ -75,32 +75,31 @@ pub(crate) fn scan(index: &mut Index, options: &Options, stats: &mut Stats) -> R
     let mut ids = HashSet::new();
     let mut crawls = Vec::new();
     for (path, file, identity) in contexts {
-        index.conn.execute(
+        index.conn.execute_cached(
             "INSERT OR IGNORE INTO crawls(identity,path) VALUES (?1,?2)",
             params![identity, path_bytes(&path)],
         )?;
-        let id: i64 =
-            index
-                .conn
-                .query_row("SELECT id FROM crawls WHERE identity=?1", [identity], |r| {
-                    r.get(0)
-                })?;
+        let id: i64 = index.conn.query_row_cached(
+            "SELECT id FROM crawls WHERE identity=?1",
+            [identity],
+            |r| r.get(0),
+        )?;
         ids.insert(id);
         crawls.push(Crawl { id, path, file });
     }
     // Missing subvolumes or changed UUIDs invalidate their old observations.
     let stale: Vec<i64> = index
         .conn
-        .prepare("SELECT id FROM crawls")?
+        .prepare_cached("SELECT id FROM crawls")?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for id in stale.into_iter().filter(|id| !ids.contains(id)) {
         let tx = index.conn.transaction()?;
-        stats.files_removed += tx.execute(
+        stats.files_removed += tx.execute_cached(
             "DELETE FROM files WHERE id IN (SELECT file_id FROM btrfs_files WHERE crawl_id=?1)",
             [id],
         )? as u64;
-        tx.execute("DELETE FROM crawls WHERE id=?1", [id])?;
+        tx.execute_cached("DELETE FROM crawls WHERE id=?1", [id])?;
         tx.commit()?;
     }
     let mut source = Native;
@@ -112,7 +111,7 @@ pub(crate) fn scan(index: &mut Index, options: &Options, stats: &mut Stats) -> R
     // Old portable observations which never mapped to an accessible inode are
     // removed only after successful native enumeration of every context.
     if stats.errors.is_empty() {
-        stats.files_removed += index.conn.execute(
+        stats.files_removed += index.conn.execute_cached(
             "DELETE FROM files WHERE id NOT IN (SELECT file_id FROM btrfs_files)",
             [],
         )? as u64;
@@ -228,7 +227,7 @@ fn discover(
     stats: &mut Stats,
 ) -> Result<()> {
     let now = source.boundary(&crawl.file)?;
-    let (completed, high): (u64, Option<u64>) = index.conn.query_row(
+    let (completed, high): (u64, Option<u64>) = index.conn.query_row_cached(
         "SELECT completed,high FROM crawls WHERE id=?1",
         [crawl.id],
         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -237,16 +236,16 @@ fn discover(
         // Restored/rolled-back filesystem: a previous extent baseline cannot
         // certify data on the new timeline, even if an inode number repeats.
         let tx = index.conn.transaction()?;
-        tx.execute(
+        tx.execute_cached(
             "DELETE FROM files WHERE id IN (SELECT file_id FROM btrfs_files WHERE crawl_id=?1)",
             [crawl.id],
         )?;
-        tx.execute("DELETE FROM discovery WHERE crawl_id=?1", [crawl.id])?;
-        tx.execute("DELETE FROM btrfs_dirs WHERE crawl_id=?1", [crawl.id])?;
-        tx.execute("UPDATE crawls SET completed=0,low=NULL,high=NULL,cursor=NULL,enumerated=0,initialized=0 WHERE id=?1",[crawl.id])?;
+        tx.execute_cached("DELETE FROM discovery WHERE crawl_id=?1", [crawl.id])?;
+        tx.execute_cached("DELETE FROM btrfs_dirs WHERE crawl_id=?1", [crawl.id])?;
+        tx.execute_cached("UPDATE crawls SET completed=0,low=NULL,high=NULL,cursor=NULL,enumerated=0,initialized=0 WHERE id=?1",[crawl.id])?;
         tx.commit()?;
     }
-    let (completed, high): (u64, Option<u64>) = index.conn.query_row(
+    let (completed, high): (u64, Option<u64>) = index.conn.query_row_cached(
         "SELECT completed,high FROM crawls WHERE id=?1",
         [crawl.id],
         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -255,7 +254,7 @@ fn discover(
         if completed == now {
             return Ok(());
         }
-        index.conn.execute(
+        index.conn.execute_cached(
             "UPDATE crawls SET low=?2,high=?3,cursor=?4,enumerated=0 WHERE id=?1",
             params![
                 crawl.id,
@@ -266,7 +265,7 @@ fn discover(
         )?;
     }
     loop {
-        let (low, high, cursor): (u64, u64, Vec<u8>) = index.conn.query_row(
+        let (low, high, cursor): (u64, u64, Vec<u8>) = index.conn.query_row_cached(
             "SELECT low,high,cursor FROM crawls WHERE id=?1",
             [crawl.id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -286,19 +285,19 @@ fn discover(
             {
                 continue;
             }
-            tx.execute("INSERT INTO discovery VALUES (?1,?2,?3) ON CONFLICT(crawl_id,ino) DO UPDATE SET directory=excluded.directory",params![crawl.id,item.key.ino,inode.directory()])?;
+            tx.execute_cached("INSERT INTO discovery VALUES (?1,?2,?3) ON CONFLICT(crawl_id,ino) DO UPDATE SET directory=excluded.directory",params![crawl.id,item.key.ino,inode.directory()])?;
             stats.discovery_jobs += 1;
         }
         if page.is_empty() || page.last().unwrap().key.next().is_none() {
             // Advancing the generation is safe because ALL discovered work is
             // durable, including jobs that fail processing and need later retry.
-            tx.execute("UPDATE crawls SET completed=high,low=NULL,high=NULL,cursor=NULL,enumerated=1 WHERE id=?1",[crawl.id])?;
+            tx.execute_cached("UPDATE crawls SET completed=high,low=NULL,high=NULL,cursor=NULL,enumerated=1 WHERE id=?1",[crawl.id])?;
             tx.commit()?;
             if high < now {
                 // Finish a resumed older window, then catch up through the
                 // boundary captured at this invocation's start. Do not chase
                 // an unbounded stream of concurrent writers.
-                index.conn.execute(
+                index.conn.execute_cached(
                     "UPDATE crawls SET low=?2,high=?3,cursor=?4,enumerated=0 WHERE id=?1",
                     params![crawl.id, high + 1, now, Key::FIRST.encode()],
                 )?;
@@ -308,7 +307,7 @@ fn discover(
         }
         let next = page.last().unwrap().key.next().unwrap();
         ensure!(next > key, "btrfs cursor did not advance");
-        tx.execute(
+        tx.execute_cached(
             "UPDATE crawls SET cursor=?2 WHERE id=?1",
             params![crawl.id, next.encode()],
         )?;
@@ -326,19 +325,19 @@ fn process(
     // Directory jobs discover deletions, scope changes and renamed descendants.
     // Process each failing job at most once per invocation.
     index.conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS attempted (ino INTEGER PRIMARY KEY); DELETE FROM attempted;")?;
-    let initial = !index.conn.query_row(
+    let initial = !index.conn.query_row_cached(
         "SELECT initialized FROM crawls WHERE id=?1",
         [crawl.id],
         |r| r.get::<_, bool>(0),
     )?;
     for directory in [true, false] {
-        index.conn.execute("DELETE FROM attempted", [])?;
+        index.conn.execute_cached("DELETE FROM attempted", [])?;
         loop {
-            let ino:Option<i64>=index.conn.query_row("SELECT ino FROM discovery WHERE crawl_id=?1 AND directory=?2 AND ino NOT IN (SELECT ino FROM attempted) ORDER BY ino LIMIT 1",params![crawl.id,directory],|r|r.get(0)).optional()?;
+            let ino:Option<i64>=index.conn.query_row_cached("SELECT ino FROM discovery WHERE crawl_id=?1 AND directory=?2 AND ino NOT IN (SELECT ino FROM attempted) ORDER BY ino LIMIT 1",params![crawl.id,directory],|r|r.get(0)).optional()?;
             let Some(ino) = ino else { break };
             index
                 .conn
-                .execute("INSERT INTO attempted VALUES (?1)", [ino])?;
+                .execute_cached("INSERT INTO attempted VALUES (?1)", [ino])?;
             let result = if directory {
                 directory_job(index, crawl, ino as u64, source, initial)
             } else {
@@ -351,10 +350,10 @@ fn process(
                 // Keep the queue entry; invalidate its hash baseline so a retry
                 // cannot trust data from an unstable or inaccessible file.
                 if !directory {
-                    index.conn.execute("DELETE FROM files WHERE id IN (SELECT file_id FROM btrfs_files WHERE crawl_id=?1 AND ino=?2)",params![crawl.id,ino])?;
+                    index.conn.execute_cached("DELETE FROM files WHERE id IN (SELECT file_id FROM btrfs_files WHERE crawl_id=?1 AND ino=?2)",params![crawl.id,ino])?;
                 }
             } else {
-                index.conn.execute(
+                index.conn.execute_cached(
                     "DELETE FROM discovery WHERE crawl_id=?1 AND ino=?2",
                     params![crawl.id, ino],
                 )?;
@@ -363,7 +362,7 @@ fn process(
         if directory {
             // Failed bootstrap directory jobs remain queued. Subsequent cycles
             // must nevertheless treat newly included subtrees as new scope.
-            index.conn.execute(
+            index.conn.execute_cached(
                 "UPDATE crawls SET initialized=1 WHERE id=?1 AND initialized=0",
                 [crawl.id],
             )?;
@@ -397,7 +396,7 @@ fn file_job(
 ) -> Result<()> {
     let paths = resolved(crawl, ino, source)?;
     let Some(path) = paths.into_iter().find(|path| in_scope(path, &index.roots)) else {
-        stats.files_removed+=index.conn.execute("DELETE FROM files WHERE id IN (SELECT file_id FROM btrfs_files WHERE crawl_id=?1 AND ino=?2)",params![crawl.id,ino])? as u64;
+        stats.files_removed+=index.conn.execute_cached("DELETE FROM files WHERE id IN (SELECT file_id FROM btrfs_files WHERE crawl_id=?1 AND ino=?2)",params![crawl.id,ino])? as u64;
         return Ok(());
     };
     let file = scan::open_regular(&path, false)?;
@@ -434,14 +433,14 @@ fn file_job(
     scan::index_file(index, &path, options, stats, &excluded, Some(&view))?;
     let file_id: Option<i64> = index
         .conn
-        .query_row(
+        .query_row_cached(
             "SELECT id FROM files WHERE dev=?1 AND ino=?2",
             params![before.dev() as i64, ino],
             |r| r.get(0),
         )
         .optional()?;
     if let Some(file_id) = file_id {
-        index.conn.execute("INSERT INTO btrfs_files VALUES (?1,?2,?3,?4) ON CONFLICT(file_id) DO UPDATE SET crawl_id=excluded.crawl_id,ino=excluded.ino,parent=excluded.parent",params![file_id,crawl.id,ino,path_bytes(path.parent().unwrap())])?;
+        index.conn.execute_cached("INSERT INTO btrfs_files VALUES (?1,?2,?3,?4) ON CONFLICT(file_id) DO UPDATE SET crawl_id=excluded.crawl_id,ino=excluded.ino,parent=excluded.parent",params![file_id,crawl.id,ino,path_bytes(path.parent().unwrap())])?;
     }
     Ok(())
 }
@@ -455,7 +454,7 @@ fn directory_job(
 ) -> Result<()> {
     let old: Option<Vec<u8>> = index
         .conn
-        .query_row(
+        .query_row_cached(
             "SELECT path FROM btrfs_dirs WHERE crawl_id=?1 AND ino=?2",
             params![crawl.id, ino],
             |r| r.get(0),
@@ -500,7 +499,7 @@ fn directory_job(
                         // seeding unknown locations avoids walking it again for
                         // each child job. Preserve known locations as rename
                         // evidence and queue validation of every child.
-                        index.conn.execute(
+                        index.conn.execute_cached(
                             "INSERT OR IGNORE INTO btrfs_dirs VALUES (?1,?2,?3,?4)",
                             params![
                                 crawl.id,
@@ -516,7 +515,7 @@ fn directory_job(
         }
     }
     let Some(path) = path.filter(|path| relevant(path, &index.roots)) else {
-        index.conn.execute(
+        index.conn.execute_cached(
             "DELETE FROM btrfs_dirs WHERE crawl_id=?1 AND ino=?2",
             params![crawl.id, ino],
         )?;
@@ -532,7 +531,7 @@ fn directory_job(
         .collect::<std::io::Result<HashSet<_>>>()?;
     // Deleted inodes have no tree item. A changed parent directory is the
     // evidence for looking up its former children and pruning deleted names.
-    let files:Vec<(u64,Vec<u8>)>=index.conn.prepare("SELECT b.ino,f.path FROM btrfs_files b JOIN files f ON f.id=b.file_id WHERE b.crawl_id=?1 AND b.parent=?2")?.query_map(params![crawl.id,path_bytes(&path)],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    let files:Vec<(u64,Vec<u8>)>=index.conn.prepare_cached("SELECT b.ino,f.path FROM btrfs_files b JOIN files f ON f.id=b.file_id WHERE b.crawl_id=?1 AND b.parent=?2")?.query_map(params![crawl.id,path_bytes(&path)],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     for (child, bytes) in files {
         let child_path = decode_path(bytes);
         if child_path
@@ -544,7 +543,9 @@ fn directory_job(
     }
     let dirs: Vec<(u64, Vec<u8>)> = index
         .conn
-        .prepare("SELECT ino,path FROM btrfs_dirs WHERE crawl_id=?1 AND parent=?2 AND ino!=?3")?
+        .prepare_cached(
+            "SELECT ino,path FROM btrfs_dirs WHERE crawl_id=?1 AND parent=?2 AND ino!=?3",
+        )?
         .query_map(params![crawl.id, path_bytes(&path), ino], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?
@@ -557,7 +558,7 @@ fn directory_job(
             queue(index, crawl.id, child, true)?;
         }
     }
-    index.conn.execute("INSERT INTO btrfs_dirs VALUES (?1,?2,?3,?4) ON CONFLICT(crawl_id,ino) DO UPDATE SET path=excluded.path,parent=excluded.parent",params![crawl.id,ino,path_bytes(&path),path_bytes(path.parent().unwrap_or(&path))])?;
+    index.conn.execute_cached("INSERT INTO btrfs_dirs VALUES (?1,?2,?3,?4) ON CONFLICT(crawl_id,ino) DO UPDATE SET path=excluded.path,parent=excluded.parent",params![crawl.id,ino,path_bytes(&path),path_bytes(path.parent().unwrap_or(&path))])?;
     Ok(())
 }
 
@@ -565,7 +566,9 @@ fn move_directories(index: &mut Index, crawl: i64, old: &Path, new: Option<&Path
     let (prefix, end) = prefix_bounds(old);
     let dirs: Vec<(u64, Vec<u8>)> = index
         .conn
-        .prepare("SELECT ino,path FROM btrfs_dirs WHERE crawl_id=?1 AND path>=?2 AND path<?3")?
+        .prepare_cached(
+            "SELECT ino,path FROM btrfs_dirs WHERE crawl_id=?1 AND path>=?2 AND path<?3",
+        )?
         .query_map(params![crawl, prefix, end], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let tx = index.conn.transaction()?;
@@ -573,7 +576,7 @@ fn move_directories(index: &mut Index, crawl: i64, old: &Path, new: Option<&Path
         if let Some(new) = new {
             let previous = decode_path(bytes);
             let path = new.join(previous.strip_prefix(old)?);
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE btrfs_dirs SET path=?3,parent=?4 WHERE crawl_id=?1 AND ino=?2",
                 params![
                     crawl,
@@ -583,7 +586,7 @@ fn move_directories(index: &mut Index, crawl: i64, old: &Path, new: Option<&Path
                 ],
             )?;
         } else {
-            tx.execute(
+            tx.execute_cached(
                 "DELETE FROM btrfs_dirs WHERE crawl_id=?1 AND ino=?2",
                 params![crawl, ino],
             )?;
@@ -594,13 +597,13 @@ fn move_directories(index: &mut Index, crawl: i64, old: &Path, new: Option<&Path
 }
 
 fn queue(index: &Index, crawl: i64, ino: u64, directory: bool) -> Result<()> {
-    index.conn.execute("INSERT INTO discovery VALUES (?1,?2,?3) ON CONFLICT(crawl_id,ino) DO UPDATE SET directory=excluded.directory",params![crawl,ino,directory])?;
+    index.conn.execute_cached("INSERT INTO discovery VALUES (?1,?2,?3) ON CONFLICT(crawl_id,ino) DO UPDATE SET directory=excluded.directory",params![crawl,ino,directory])?;
     Ok(())
 }
 
 fn queue_prefix(index: &Index, crawl: i64, path: &Path) -> Result<()> {
     let (prefix, end) = prefix_bounds(path);
-    index.conn.execute("INSERT OR IGNORE INTO discovery SELECT b.crawl_id,b.ino,0 FROM btrfs_files b JOIN files f ON f.id=b.file_id WHERE b.crawl_id=?1 AND f.path>=?2 AND f.path<?3",params![crawl,prefix,end])?;
+    index.conn.execute_cached("INSERT OR IGNORE INTO discovery SELECT b.crawl_id,b.ino,0 FROM btrfs_files b JOIN files f ON f.id=b.file_id WHERE b.crawl_id=?1 AND f.path>=?2 AND f.path<?3",params![crawl,prefix,end])?;
     Ok(())
 }
 

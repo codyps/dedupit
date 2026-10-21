@@ -1,7 +1,7 @@
 use crate::{backend, scan, Backend, Duplicate, Granularity, Options, Outcome, Range, Stats};
 use anyhow::{bail, ensure, Context, Result};
 use fs2::FileExt;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Params, Row};
 use std::{
     fs::{self, File, OpenOptions},
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
@@ -12,8 +12,37 @@ pub(crate) struct Index {
     pub conn: Connection,
     pub roots: Vec<PathBuf>,
     pub excluded: Vec<PathBuf>,
+    pub buffer: Vec<u8>,
     _lock: File,
     _database: File,
+}
+
+/// Repeated scan/job statements share a bounded connection-local cache, also
+/// through Transaction's deref. Dropping a cached statement resets it and clears
+/// its bindings before reuse; transaction boundaries and durability are unchanged.
+pub(crate) trait SqlCache {
+    fn execute_cached(&self, sql: &str, params: impl Params) -> rusqlite::Result<usize>;
+    fn query_row_cached<T>(
+        &self,
+        sql: &str,
+        params: impl Params,
+        read: impl FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T>;
+}
+
+impl SqlCache for Connection {
+    fn execute_cached(&self, sql: &str, params: impl Params) -> rusqlite::Result<usize> {
+        self.prepare_cached(sql)?.execute(params)
+    }
+
+    fn query_row_cached<T>(
+        &self,
+        sql: &str,
+        params: impl Params,
+        read: impl FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        self.prepare_cached(sql)?.query_row(params, read)
+    }
 }
 
 pub(crate) fn path_bytes(path: &Path) -> &[u8] {
@@ -87,6 +116,8 @@ impl Index {
         // bypass the single-writer guard by acquiring different sidecar locks.
         FileExt::try_lock_exclusive(&db_file).context("database inode is already in use")?;
         let conn = Connection::open(&database)?;
+        // Enough for the scan/apply working set without growing with file count.
+        conn.set_prepared_statement_cache_capacity(64);
         conn.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
         )?;
@@ -227,6 +258,7 @@ impl Index {
             conn,
             roots: reduced,
             excluded,
+            buffer: Vec::new(),
             _lock: lock,
             _database: db_file,
         })
@@ -235,7 +267,7 @@ impl Index {
     pub fn summarize(&self, stats: &mut Stats) -> Result<()> {
         let cached: Option<Vec<u8>> = self
             .conn
-            .query_row("SELECT value FROM config WHERE key='summary'", [], |r| {
+            .query_row_cached("SELECT value FROM config WHERE key='summary'", [], |r| {
                 r.get(0)
             })
             .optional()?;
@@ -249,7 +281,7 @@ impl Index {
             return Ok(());
         }
         for kind in [0, 1] {
-            let (count, bytes): (u64, u64) = self.conn.query_row(
+            let (count, bytes): (u64, u64) = self.conn.query_row_cached(
                 "SELECT COALESCE(SUM(n-1),0), COALESCE(SUM((n-1)*length),0)
                  FROM (SELECT COUNT(*) n, length FROM ranges WHERE kind=?1
                        GROUP BY hash,length HAVING COUNT(*)>1)",
@@ -272,7 +304,7 @@ impl Index {
             stats.duplicate_chunks,
             stats.duplicate_chunk_bytes,
         ])?;
-        self.conn.execute(
+        self.conn.execute_cached(
             "INSERT OR REPLACE INTO config(key,value) VALUES ('summary',?1)",
             [cached],
         )?;
@@ -280,7 +312,7 @@ impl Index {
     }
 
     pub fn list_duplicates(&self, visit: &mut impl FnMut(Duplicate) -> Result<()>) -> Result<()> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare_cached(
             "SELECT f.path,r.offset,r.length,r.kind,r.hash FROM ranges r
              JOIN files f ON f.id=r.file_id
              JOIN (SELECT kind,hash,length FROM ranges GROUP BY kind,hash,length
@@ -319,7 +351,7 @@ impl Index {
     pub fn apply(&mut self, backend: &mut impl Backend, stats: &mut Stats) -> Result<()> {
         // Clear unique ranges in one durable operation, rather than committing
         // once per unique chunk. Only changed/new ranges are pending on reruns.
-        self.conn.execute(
+        self.conn.execute_cached(
             "UPDATE ranges AS t SET pending=0 WHERE t.pending=1 AND NOT EXISTS (
                SELECT 1 FROM ranges s JOIN files f ON f.id=s.file_id
                WHERE s.kind=t.kind AND s.hash=t.hash AND s.length=t.length AND s.id<t.id
@@ -341,7 +373,7 @@ impl Index {
     }
 
     fn next_pending(&self, kind: i64, cursor: i64) -> Result<Option<Job>> {
-        Ok(self.conn.query_row(
+        Ok(self.conn.query_row_cached(
             &format!("{JOB_SELECT} WHERE r.pending=1 AND r.kind=?1 AND r.id>?2 ORDER BY r.id LIMIT 1"),
             params![kind, cursor], Job::from_row,
         ).optional()?)
@@ -361,7 +393,7 @@ impl Index {
             // lookup and keyset iteration use the matches index.
             let source = self
                 .conn
-                .query_row(
+                .query_row_cached(
                     &format!(
                         "{JOB_SELECT} WHERE r.kind=?1 AND r.hash=?2 AND r.length=?3
                           AND r.id>?4 AND r.id<?5 AND f.fskey=?6 ORDER BY r.id LIMIT 1"
@@ -380,7 +412,7 @@ impl Index {
             let Some(source) = source else {
                 if !found {
                     self.conn
-                        .execute("UPDATE ranges SET pending=0 WHERE id=?1", [target.id])?;
+                        .execute_cached("UPDATE ranges SET pending=0 WHERE id=?1", [target.id])?;
                 }
                 return Ok(());
             };
@@ -496,13 +528,13 @@ impl Index {
             }
             if complete {
                 let tx = self.conn.transaction()?;
-                tx.execute(
+                tx.execute_cached(
                     "INSERT OR REPLACE INTO completed(target,source) VALUES (?1,?2)",
                     params![target.id, source.id],
                 )?;
-                tx.execute("UPDATE ranges SET pending=0 WHERE id=?1", [target.id])?;
+                tx.execute_cached("UPDATE ranges SET pending=0 WHERE id=?1", [target.id])?;
                 if target.kind == 1 {
-                    tx.execute(
+                    tx.execute_cached(
                         "UPDATE ranges SET pending=0 WHERE file_id=?1 AND kind=0",
                         [target.file_id],
                     )?;
@@ -523,8 +555,8 @@ impl Index {
         // directory rename). Preserve its native identity before deleting the
         // path/hash record; no future inode event is required to rediscover it.
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("INSERT OR IGNORE INTO discovery SELECT crawl_id,ino,0 FROM btrfs_files WHERE file_id=?1",[file_id])?;
-        tx.execute("DELETE FROM files WHERE id=?1", [file_id])?;
+        tx.execute_cached("INSERT OR IGNORE INTO discovery SELECT crawl_id,ino,0 FROM btrfs_files WHERE file_id=?1",[file_id])?;
+        tx.execute_cached("DELETE FROM files WHERE id=?1", [file_id])?;
         tx.commit()?;
         Ok(())
     }
