@@ -348,20 +348,28 @@ fn process(
                 "native-file"
             })?;
             let bytes_before = stats.bytes_hashed;
-            // The entire observation (including file identity and queue ack)
-            // belongs to one batch. Roll back a failed job's partial directory
-            // edits without discarding earlier successful jobs in this batch.
-            index.conn.execute_batch("SAVEPOINT discovery_job")?;
+            // Directory reconciliation can make partial namespace edits, so it
+            // uses a savepoint. Failed file jobs explicitly discard their file
+            // records; avoiding a long-lived nested savepoint keeps dense
+            // hashing from journaling every modified index page twice.
+            if directory {
+                index.conn.execute_batch("SAVEPOINT discovery_job")?;
+            }
             let result = if directory {
                 directory_job(index, crawl, ino as u64, source, initial)
             } else {
                 file_job(index, crawl, ino as u64, options, source, stats)
             };
-            if result.is_err() {
+            if directory && result.is_err() {
                 index.conn.execute_batch("ROLLBACK TO discovery_job")?;
             }
-            index.conn.execute_batch("RELEASE discovery_job")?;
+            if directory {
+                index.conn.execute_batch("RELEASE discovery_job")?;
+            }
             if let Err(error) = result {
+                index
+                    .check_batch()
+                    .with_context(|| format!("fatal native job: {error:#}"))?;
                 stats
                     .errors
                     .push(format!("btrfs {:?} inode {ino}: {error:#}", crawl.path));
@@ -419,7 +427,25 @@ fn file_job(
         stats.files_removed+=index.conn.execute_cached("DELETE FROM files WHERE id IN (SELECT file_id FROM btrfs_files WHERE crawl_id=?1 AND ino=?2)",params![crawl.id,ino])? as u64;
         return Ok(());
     };
-    let file = scan::open_regular(&path, false)?;
+    let result = file_job_at(index, crawl, ino, options, source, stats, &path);
+    if result.is_err() {
+        index
+            .discard_file(&path)
+            .context("invalidate failed native observation")?;
+    }
+    result
+}
+
+fn file_job_at(
+    index: &mut Index,
+    crawl: &Crawl,
+    ino: u64,
+    options: &Options,
+    source: &mut impl Source,
+    stats: &mut Stats,
+    path: &Path,
+) -> Result<()> {
+    let file = scan::open_regular(path, false)?;
     let before = file.metadata()?;
     ensure!(
         before.ino() == ino && source.same_tree(&file, &crawl.file)?,
@@ -450,7 +476,7 @@ fn file_job(
         .map(|m| (m.dev(), m.ino()))
         .collect::<Vec<_>>();
     stats.files_seen += 1;
-    scan::index_file(index, &path, options, stats, &excluded, Some(&view))?;
+    scan::index_file(index, path, options, stats, &excluded, Some(&view))?;
     let file_id: Option<i64> = index
         .conn
         .query_row_cached(

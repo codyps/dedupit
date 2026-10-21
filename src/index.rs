@@ -20,7 +20,7 @@ pub(crate) struct Index {
 }
 
 // Only flush_batch commits the outer transaction. Dropping Index on an error
-// or panic lets SQLite roll it back; releasing a file/job savepoint never makes
+// or panic lets SQLite roll it back; releasing a metadata savepoint never makes
 // that operation durable independently of its batch.
 struct Batch {
     active: bool,
@@ -30,6 +30,7 @@ struct Batch {
     bytes: u64,
     limit: usize,
     commits: u64,
+    poisoned: bool,
 }
 
 /// Repeated scan/job statements share a bounded connection-local cache, also
@@ -287,6 +288,7 @@ impl Index {
                 bytes: 0,
                 limit: options.commit_batch_size,
                 commits: 0,
+                poisoned: false,
             },
             _lock: lock,
             _database: db_file,
@@ -294,6 +296,7 @@ impl Index {
     }
 
     pub fn begin_batch(&mut self, phase: &'static str) -> Result<()> {
+        self.check_batch()?;
         if self.batch.active {
             ensure!(
                 !self.conn.is_autocommit(),
@@ -319,6 +322,7 @@ impl Index {
     }
 
     pub fn batch_step(&mut self, bytes: u64) -> Result<()> {
+        self.check_batch()?;
         ensure!(
             self.batch.active && !self.conn.is_autocommit(),
             "database batch was unexpectedly rolled back"
@@ -339,6 +343,7 @@ impl Index {
     }
 
     pub fn flush_batch(&mut self) -> Result<()> {
+        self.check_batch()?;
         if self.batch.active {
             #[cfg(feature = "test-failpoints")]
             self.test_hook(&format!("{}:before-commit", self.batch.phase))?;
@@ -353,6 +358,33 @@ impl Index {
 
     pub fn batch_commits(&self) -> u64 {
         self.batch.commits
+    }
+
+    pub fn check_batch(&self) -> Result<()> {
+        ensure!(
+            !self.batch.poisoned,
+            "file cleanup failed; database batch must be rolled back on restart"
+        );
+        ensure!(
+            !self.batch.active || !self.conn.is_autocommit(),
+            "database batch was unexpectedly rolled back"
+        );
+        Ok(())
+    }
+
+    /// On a failed file, invalidate both its old and partially written records
+    /// before any later batch commit. A cleanup failure is fatal: never allow
+    /// a caller collecting per-file errors to commit the incomplete file.
+    pub fn discard_file(&mut self, path: &Path) -> Result<()> {
+        self.check_batch()?;
+        if let Err(error) = self
+            .conn
+            .execute_cached("DELETE FROM files WHERE path=?1", [path_bytes(path)])
+        {
+            self.batch.poisoned = true;
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     pub fn test_hook(&self, event: &str) -> Result<()> {
@@ -633,19 +665,21 @@ impl Index {
             }
             if complete {
                 self.test_hook("apply:shared")?;
-                let tx = self.conn.savepoint()?;
-                tx.execute_cached(
+                // These records are one part of the enclosing batch. Any SQL
+                // failure aborts apply and rolls the entire unfinished batch
+                // back, so no nested per-job rollback journal is needed.
+                self.conn.execute_cached(
                     "INSERT OR REPLACE INTO completed(target,source) VALUES (?1,?2)",
                     params![target.id, source.id],
                 )?;
-                tx.execute_cached("UPDATE ranges SET pending=0 WHERE id=?1", [target.id])?;
+                self.conn
+                    .execute_cached("UPDATE ranges SET pending=0 WHERE id=?1", [target.id])?;
                 if target.kind == 1 {
-                    tx.execute_cached(
+                    self.conn.execute_cached(
                         "UPDATE ranges SET pending=0 WHERE file_id=?1 AND kind=0",
                         [target.file_id],
                     )?;
                 }
-                tx.commit()?;
                 stats.jobs_completed += 1;
                 return Ok(());
             }
@@ -660,10 +694,9 @@ impl Index {
         // A path can become stale after discovery's committed window (e.g. a
         // directory rename). Preserve its native identity before deleting the
         // path/hash record; no future inode event is required to rediscover it.
-        let tx = self.conn.savepoint()?;
-        tx.execute_cached("INSERT OR IGNORE INTO discovery SELECT crawl_id,ino,0 FROM btrfs_files WHERE file_id=?1",[file_id])?;
-        tx.execute_cached("DELETE FROM files WHERE id=?1", [file_id])?;
-        tx.commit()?;
+        self.conn.execute_cached("INSERT OR IGNORE INTO discovery SELECT crawl_id,ino,0 FROM btrfs_files WHERE file_id=?1",[file_id])?;
+        self.conn
+            .execute_cached("DELETE FROM files WHERE id=?1", [file_id])?;
         Ok(())
     }
 }

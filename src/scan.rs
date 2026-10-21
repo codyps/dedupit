@@ -247,12 +247,9 @@ fn portable(index: &mut Index, options: &Options, stats: &mut Stats) -> Result<(
             let bytes_before = stats.bytes_hashed;
             if let Err(error) = index_file(index, entry.path(), options, stats, &excluded_ids, None)
             {
-                index.begin_batch("portable")?; // reject an automatic SQLite rollback
-                                                // Never leave old hashes usable after a failed scan of a path.
-                index.conn.execute(
-                    "DELETE FROM files WHERE path=?1",
-                    [path_bytes(entry.path())],
-                )?;
+                index
+                    .check_batch()
+                    .with_context(|| format!("fatal scan {:?}: {error:#}", entry.path()))?;
                 stats
                     .errors
                     .push(format!("scan {:?}: {error:#}", entry.path()));
@@ -286,6 +283,53 @@ pub(crate) struct Extent {
 }
 
 pub(crate) fn index_file(
+    index: &mut Index,
+    path: &Path,
+    options: &Options,
+    stats: &mut Stats,
+    excluded_ids: &[(u64, u64)],
+    native: Option<&NativeView>,
+) -> Result<()> {
+    let result = index_file_inner(index, path, options, stats, excluded_ids, native);
+    if result.is_err() {
+        index.discard_file(path).context("invalidate failed file")?;
+    }
+    result
+}
+
+// A standalone call owns its transaction. Within a batch, failure cleanup in
+// index_file removes the entire failed file before any commit, so a long-lived
+// nested savepoint (and its per-page rollback journal) is unnecessary.
+enum FileUpdate<'a> {
+    Standalone(rusqlite::Savepoint<'a>),
+    Batched(&'a rusqlite::Connection),
+}
+impl<'a> FileUpdate<'a> {
+    fn new(conn: &'a mut rusqlite::Connection) -> rusqlite::Result<Self> {
+        if conn.is_autocommit() {
+            Ok(Self::Standalone(conn.savepoint()?))
+        } else {
+            Ok(Self::Batched(conn))
+        }
+    }
+    fn commit(self) -> rusqlite::Result<()> {
+        match self {
+            Self::Standalone(tx) => tx.commit(),
+            Self::Batched(_) => Ok(()),
+        }
+    }
+}
+impl std::ops::Deref for FileUpdate<'_> {
+    type Target = rusqlite::Connection;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Standalone(tx) => tx,
+            Self::Batched(conn) => conn,
+        }
+    }
+}
+
+fn index_file_inner(
     index: &mut Index,
     path: &Path,
     options: &Options,
@@ -346,7 +390,7 @@ pub(crate) fn index_file(
                 .conn
                 .execute_cached("INSERT INTO seen VALUES (?1)", [id])?;
             if let Some(view) = native {
-                let tx = index.conn.savepoint()?;
+                let tx = FileUpdate::new(&mut index.conn)?;
                 store_extents(&tx, *id, view)?;
                 tx.commit()?;
             }
@@ -354,7 +398,7 @@ pub(crate) fn index_file(
             return Ok(());
         }
     }
-    let tx = index.conn.savepoint()?;
+    let tx = FileUpdate::new(&mut index.conn)?;
     // A name may now refer to a different inode. Invalidate it atomically with
     // insertion/rename of the current inode's row.
     tx.execute_cached(
@@ -554,6 +598,8 @@ pub(crate) fn index_file(
         tx.execute_cached("DELETE FROM extent_state WHERE file_id=?1", [file_id])?;
         tx.execute_cached("DELETE FROM file_extents WHERE file_id=?1", [file_id])?;
     }
+    #[cfg(feature = "test-failpoints")]
+    crate::failpoints::hit(&tx, "file:hashed")?;
     ensure!(
         fingerprint(&file.metadata()?) == version,
         "file changed while hashing; retry on next run"

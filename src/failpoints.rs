@@ -19,6 +19,9 @@ pub(crate) fn hit(conn: &Connection, event: &str) -> Result<()> {
     if HITS.fetch_add(1, Ordering::Relaxed) + 1 != target {
         return Ok(());
     }
+    if std::env::var("DEDUPIT_TEST_ACTION").as_deref() == Ok("error") {
+        bail!("injected test failure at {event}");
+    }
     let mut marker = OpenOptions::new()
         .write(true)
         .create_new(true)

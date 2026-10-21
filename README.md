@@ -67,9 +67,12 @@ those budgets. `--commit-batch-size 1` selects individual operation commits;
 values through 4096 are supported. The policy can change when restarting the
 same index. SQLite remains in WAL mode with `synchronous=FULL`.
 
-Each file update uses a [savepoint](https://www.sqlite.org/lang_savepoint.html)
-inside the batch. A failed file rolls back its partial hashes while earlier
-successful files can still commit. Btrfs hashes, identity/mapping records, and
+File hashes are staged directly in the batch transaction. A failed file's entire
+cache entry, including partial hashes, is invalidated before the batch can
+commit, preserving successful neighbors. If that cleanup fails, the batch is
+poisoned and the run aborts: none of its staged changes can commit. Directory
+reconciliation uses [savepoints](https://www.sqlite.org/lang_savepoint.html) to
+roll back partial namespace edits. Btrfs hashes, identity/mapping records, and
 their queue acknowledgements commit together. Discovery cursors and the work
 they enqueue also commit together. Apply completion records are staged only
 after the kernel reports success and file identities are revalidated. A process
@@ -147,7 +150,7 @@ The portable fallback works as follows:
   metadata checks but no content reads. Unchanged observations use a temporary
   table, avoiding a durable database write/fsync per file.
 * Changed files are hashed with one reusable chunk buffer. Their old range
-  records are replaced under a per-file savepoint only after verifying stable
+  records are replaced within the enclosing batch only after verifying stable
   descriptor metadata and path identity. Interrupted or unstable scans cannot
   commit a partially hashed file. A changed file is read in full; this does not
   require filesystem change journals or kernel-specific dirty-block tracking.
@@ -340,7 +343,8 @@ cycle the test kills an apply process with new completion records staged inside
 an unfinished batch, modifies files during downtime, and resumes `--apply`;
 each seed must exercise an apply interruption too.
 
-Three additional tests exercise 13 deterministic crash cases: portable scans
+Four additional tests exercise 13 deterministic crash cases and file-failure
+cleanup: portable scans
 with spilled uncommitted WAL pages, btrfs discovery cursors and hash/queue
 acknowledgements, and apply before/after commits and between kernel sharing and
 database acknowledgement. An independent reader captures the complete durable
@@ -348,10 +352,12 @@ database state while the child is stopped; recovery must reproduce that state
 exactly, including hashes, queue entries, cursors and completion records. Restart
 checks prove committed files/jobs are reused, reconcile downtime mutations,
 compare against a fresh full scan, verify contents and copy-on-write isolation,
-and check SQLite integrity/foreign keys. Random stress uses two-operation
+and check SQLite integrity/foreign keys. Injected file errors prove successful
+neighbors survive and failed-file records are removed; an injected cleanup
+failure must abort and roll back the entire unfinished batch. Random stress uses two-operation
 batches; the deterministic cases use the default 64-operation batches.
 
-The QEMU runner builds with the `test-failpoints` feature and requires all three
+The QEMU runner builds with the `test-failpoints` feature and requires all four
 batch crash tests in the compiled test listing, so omission of the feature or a
 required test fails CI. Stop hooks and the tiny SQLite cache used to force WAL
 spill exist only in that opt-in test build; normal builds contain neither.

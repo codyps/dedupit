@@ -103,6 +103,7 @@ def validate_guest(serial, returncode, expected_tests):
 
 
 REQUIRED_BATCH_TESTS = {
+    "batch_crashes::failed_file_cleanup_keeps_batch_neighbors_and_cleanup_failure_aborts_the_batch",
     "batch_crashes::portable_batches_recover_uncommitted_spilled_wal_and_keep_committed_files",
     "batch_crashes::native_batches_keep_discovery_cursors_and_hash_acknowledgements_atomic",
     "batch_crashes::apply_batches_replay_only_uncommitted_completions_and_preserve_cow_contents",

@@ -218,8 +218,9 @@ fn fixture(portable: bool) -> Option<(tempfile::TempDir, Options, Contents)> {
     }
     Some((dir, options, contents))
 }
-fn run(options: &Options, apply: bool) -> Value {
-    let output = Command::new(env!("CARGO_BIN_EXE_dedupit"))
+fn cli(options: &Options, apply: bool) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dedupit"));
+    command
         .arg("--database")
         .arg(&options.database)
         .args(["--json", "--chunk-size", "4096", "--scanner"])
@@ -231,9 +232,11 @@ fn run(options: &Options, apply: bool) -> Value {
         .arg("--commit-batch-size")
         .arg(options.commit_batch_size.to_string())
         .args(if apply { vec!["--apply"] } else { vec![] })
-        .arg(&options.roots[0])
-        .output()
-        .unwrap();
+        .arg(&options.roots[0]);
+    command
+}
+fn run(options: &Options, apply: bool) -> Value {
+    let output = cli(options, apply).output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -242,6 +245,71 @@ fn run(options: &Options, apply: bool) -> Value {
     let stats: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stats["errors"], serde_json::json!([]));
     stats
+}
+
+#[test]
+fn failed_file_cleanup_keeps_batch_neighbors_and_cleanup_failure_aborts_the_batch() {
+    for portable in [true, false] {
+        let Some((_dir, options, contents)) = fixture(portable) else {
+            continue;
+        };
+        let output = cli(&options, false)
+            .env("DEDUPIT_TEST_FAILPOINT", "file:hashed")
+            .env("DEDUPIT_TEST_HIT", "3")
+            .env("DEDUPIT_TEST_ACTION", "error")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stats: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(stats["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            reader(&options.database)
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, usize>(0))
+                .unwrap(),
+            contents.len() - 1
+        );
+        let resumed = run(&options, options.scanner != Scanner::Portable);
+        assert_eq!(
+            resumed["files_hashed"], 1,
+            "successful neighbors must survive a failed file"
+        );
+        verify(&options, &contents);
+    }
+
+    let (_dir, options, mut contents) = fixture(true).unwrap();
+    run(&options, false);
+    let conn = Connection::open(&options.database).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_cleanup BEFORE DELETE ON files BEGIN SELECT RAISE(ABORT,'injected cleanup failure'); END;").unwrap();
+    let (_, before) = durable_state(&options.database);
+    for (path, bytes) in &mut contents {
+        bytes[0] ^= 0xff;
+        fs::write(path, bytes).unwrap();
+    }
+    let output = cli(&options, false)
+        .env("DEDUPIT_TEST_FAILPOINT", "file:hashed")
+        .env("DEDUPIT_TEST_HIT", "3")
+        .env("DEDUPIT_TEST_ACTION", "error")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("file cleanup failed"));
+    let (_, after) = durable_state(&options.database);
+    assert_eq!(
+        before, after,
+        "cleanup failure must roll back every staged file in the batch"
+    );
+    conn.execute_batch("DROP TRIGGER fail_cleanup").unwrap();
+    let resumed = run(&options, false);
+    assert_eq!(
+        resumed["files_hashed"].as_u64().unwrap(),
+        contents.len() as u64
+    );
+    verify(&options, &contents);
 }
 fn verify(options: &Options, contents: &Contents) {
     for (path, bytes) in contents {
@@ -257,7 +325,7 @@ fn verify(options: &Options, contents: &Contents) {
         stress::inventory(&options.database, &options.roots[0]),
         stress::inventory(&fresh, &options.roots[0])
     );
-    let idle = run(options, true);
+    let idle = run(options, options.scanner != Scanner::Portable);
     assert_eq!(idle["bytes_hashed"], 0);
     assert_eq!(idle["jobs_attempted"], 0);
 }
@@ -291,7 +359,7 @@ fn portable_batches_recover_uncommitted_spilled_wal_and_keep_committed_files() {
         } else {
             assert!(observation.staged["files"].as_u64().unwrap() > durable);
         }
-        let resumed = run(&options, true);
+        let resumed = run(&options, false);
         assert_eq!(
             resumed["files_hashed"].as_u64().unwrap(),
             contents.len() as u64 - durable

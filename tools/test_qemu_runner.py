@@ -48,7 +48,7 @@ class GuestValidationTests(unittest.TestCase):
 
     def test_missing_batch_crash_feature_or_test_fails(self):
         listing = "\n".join(name + ": test" for name in runner.REQUIRED_BATCH_TESTS)
-        self.assertEqual(runner.validate_listing(listing), 3)
+        self.assertEqual(runner.validate_listing(listing), len(runner.REQUIRED_BATCH_TESTS))
         for output in ["", "ordinary_discovery: test", listing.split("\n", 1)[1]]:
             with self.subTest(output=output), self.assertRaises(RuntimeError):
                 runner.validate_listing(output)
