@@ -82,13 +82,27 @@ Previously committed batches remain reusable. Phase boundaries and normal exit
 flush the final batch; fatal errors and unwinding roll it back. Batching trades
 bounded repeated work after a crash for fewer synchronous commits.
 
+Native btrfs `--apply` captures destination extent maps through its already-open
+file descriptors. Maps and completion records share the apply batch. The maps
+remain provisional until a final filesystem commit flushes btrfs's delayed inode
+updates. A batched metadata search then confirms only inode items whose size,
+mtime, ctime and incarnation still match the indexed file. The same discovery batches durably queue unrelated inode and directory changes
+before advancing their cursors or generation boundary.
+
+A successful apply therefore needs no destination reopening or mapping refresh
+on the next invocation. After a crash, startup queues every unconfirmed mapping.
+Unchanged files refresh their maps without reading contents or losing committed
+completions; changed files with provisional maps are fully rehashed because the
+filesystem transaction might have rolled back independently of SQLite. File
+hashes never adopt new timestamps merely because deduplication succeeded.
+
 `--verify` ignores metadata caching and rehashes everything. Use it periodically,
 after restoring an index, or for filesystems with coarse/unreliable timestamps.
 It also reconsiders successful work; physical layout changes made by external
 tools may not always change the metadata used by the cache. Verification always
 performs a portable full reconciliation and resets the native crawl baseline.
 Switching from portable discovery to btrfs discovery likewise establishes a new
-baseline. Existing version-1/2 indexes upgrade transactionally to version 3
+baseline. Existing version-1/2/3 indexes upgrade transactionally to version 4
 without rereading files; legacy zero-filled chunk candidates are removed.
 
 Exit code 0 means the run finished without operational errors. Exit code 2
@@ -439,7 +453,7 @@ cycle the test kills an apply process with new completion records staged inside
 an unfinished batch, modifies files during downtime, and resumes `--apply`;
 each seed must exercise an apply interruption too.
 
-Four additional tests exercise 15 deterministic crash cases and file-failure
+Six additional tests exercise 22 deterministic crash cases, concurrent writes during apply confirmation, and file-failure
 cleanup: portable scans
 with spilled uncommitted WAL pages, btrfs discovery cursors and hash/queue
 acknowledgements, and apply before/after commits and between kernel sharing and
@@ -453,8 +467,8 @@ neighbors survive and failed-file records are removed; an injected cleanup
 failure must abort and roll back the entire unfinished batch. Random stress uses two-operation
 batches; deterministic cases cover both 64- and 1024-operation batches.
 
-The QEMU runner builds with the `test-failpoints` feature and requires all four
-batch crash tests in the compiled test listing, so omission of the feature or a
+The QEMU runner builds with the `test-failpoints` feature and requires all six
+batch crash and concurrent-write tests in the compiled test listing, so omission of the feature or a
 required test fails CI. Stop hooks and the tiny SQLite cache used to force WAL
 spill exist only in that opt-in test build; normal builds contain neither.
 
@@ -497,7 +511,7 @@ python3 tools/test-btrfs-qemu.py \
 The runner builds the current Rust discovery tests and includes their dynamic
 libraries in the guest, preserving their paths (including Nix store paths).
 `--cargo` and `--qemu` select executables outside `PATH`. Serial output is saved
-to `target/btrfs-qemu.log`; the timeout defaults to 600 seconds. The temporary
+to `target/btrfs-qemu.log`; the timeout defaults to 900 seconds. The temporary
 disk and initramfs are removed after the run. This runner was exercised with
 QEMU 11.1.1 and Linux 6.18.55. To replay a failing stress seed or increase the
 workload, add `--stress-seed DECIMAL_U64 --stress-rounds N` (1 through 256).

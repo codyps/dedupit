@@ -109,6 +109,22 @@ impl Inode {
     } // NODATASUM / NODATACOW
 }
 
+/// The committed inode must still describe the exact content epoch indexed by
+/// fstat after btrfs flushes delayed inode updates. Confirmation is bounded by
+/// a committed transid; later writes belong to a future discovery window.
+/// Never adopt new data timestamps.
+pub fn matches_fingerprint(item: &[u8], fingerprint: &[u8]) -> Result<bool> {
+    ensure!(
+        item.len() >= 160 && fingerprint.len() == 56,
+        "invalid inode fingerprint"
+    );
+    Ok(le64(item, 16)? == le64(fingerprint, 16)?
+        && le64(item, 136)? == le64(fingerprint, 24)?
+        && u64::from(le32(item, 144)?) == le64(fingerprint, 32)?
+        && le64(item, 124)? == le64(fingerprint, 40)?
+        && u64::from(le32(item, 132)?) == le64(fingerprint, 48)?)
+}
+
 #[repr(C)]
 #[derive(Default)]
 struct SearchKey {
@@ -133,7 +149,14 @@ struct SearchHeader {
 nix::ioctl_readwrite!(search_ioctl, 0x94, 17, SearchHeader);
 
 pub fn search(file: &File, tree: u64, start: Key, end: Key, min_transid: u64) -> Result<Vec<Item>> {
-    let mut size: usize = 64 * 1024;
+    // Point/inode extent lookups usually return just a few small items. Avoid
+    // zeroing 64 KiB several times per apply job; EOVERFLOW still grows for
+    // large inline items, and fragmented maps continue through pagination.
+    let mut size: usize = if start.ino == end.ino {
+        4096
+    } else {
+        64 * 1024
+    };
     loop {
         // u64 allocation supplies alignment for the header and flexible buffer.
         let mut storage = vec![0u64; (112 + size).div_ceil(8)];
@@ -216,15 +239,22 @@ fn parse_page(bytes: &[u8], count: usize, start: Key, end: Key) -> Result<Vec<It
 }
 
 pub fn inode(file: &File, ino: u64) -> Result<Option<Inode>> {
+    inode_item(file, ino)?
+        .as_deref()
+        .map(Inode::parse)
+        .transpose()
+}
+
+pub fn inode_item(file: &File, ino: u64) -> Result<Option<Vec<u8>>> {
     let key = Key {
         ino,
         kind: INODE,
         offset: 0,
     };
-    search(file, 0, key, key, 0)?
-        .first()
-        .map(|item| Inode::parse(&item.data))
-        .transpose()
+    Ok(search(file, 0, key, key, 0)?
+        .into_iter()
+        .next()
+        .map(|item| item.data))
 }
 
 pub fn extents(file: &File, ino: u64) -> Result<Vec<Extent>> {

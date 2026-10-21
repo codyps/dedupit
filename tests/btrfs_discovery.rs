@@ -68,6 +68,70 @@ fn data(size: usize) -> Vec<u8> {
 }
 
 #[test]
+fn native_apply_caches_mappings_without_refresh_and_keeps_writes_incremental() {
+    let (_dir, mut options) = setup();
+    options.chunk_size = 128 * 1024;
+    let bytes = data(2 * 1024 * 1024);
+    for name in ["a", "b"] {
+        fs::write(options.roots[0].join(name), &bytes).unwrap();
+    }
+    for (name, edge) in [("c", 19), ("d", 21)] {
+        let mut partial = vec![edge; 3 * options.chunk_size];
+        partial[options.chunk_size..2 * options.chunk_size]
+            .copy_from_slice(&bytes[..options.chunk_size]);
+        fs::write(options.roots[0].join(name), partial).unwrap();
+    }
+    if first(&options).is_none() {
+        return;
+    }
+    let applied = dedupit::run(&options, true).unwrap();
+    assert!(applied.errors.is_empty(), "{applied:?}");
+    assert!(
+        applied.bytes_deduped > 0 && applied.jobs_completed >= 2,
+        "{applied:?}"
+    );
+    assert_eq!(applied.btrfs_mapping_updates, applied.jobs_completed);
+    let idle = scan(&options); // New Index/connection, no settling pass allowed.
+    assert_eq!(idle.files_seen, 0, "{idle:?}");
+    assert_eq!(idle.bytes_hashed, 0);
+    assert!(applied.btrfs_events_reused > 0, "{applied:?}");
+    for name in ["a", "b"] {
+        assert_eq!(fs::read(options.roots[0].join(name)).unwrap(), bytes);
+    }
+    OpenOptions::new()
+        .write(true)
+        .open(options.roots[0].join("b"))
+        .unwrap()
+        .write_all_at(&[42; 4096], 1024 * 1024)
+        .unwrap();
+    let changed = scan(&options);
+    assert_eq!(changed.files_hashed, 1, "{changed:?}");
+    assert_eq!(
+        changed.bytes_hashed, options.chunk_size as u64,
+        "{changed:?}"
+    );
+    assert!(changed.chunks_reused > 0);
+    let expected = stress::inventory(&options.database, &options.roots[0]);
+    let mut fresh = options.clone();
+    fresh.database.set_file_name("oracle.sqlite");
+    fresh.scanner = Scanner::Portable;
+    fresh.verify = true;
+    scan(&fresh);
+    assert_eq!(
+        expected,
+        stress::inventory(&fresh.database, &options.roots[0])
+    );
+    // Namespace changes still take precedence over cached inode observations.
+    fs::rename(options.roots[0].join("d"), options.roots[0].join("renamed")).unwrap();
+    scan(&options);
+    dedupit::list_duplicates(&options, |d| {
+        assert!(d.source.exists() && d.destination.exists());
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn native_discovery_idle_run_opens_no_old_files_and_small_writes_reuse_hashes() {
     let (_dir, mut options) = setup();
     options.granularity = Granularity::File;

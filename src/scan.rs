@@ -217,7 +217,7 @@ pub(crate) fn scan(index: &mut Index, options: &Options, stats: &mut Stats) -> R
     // native run must establish a fresh baseline, even if fingerprints match.
     index
         .conn
-        .execute_batch("DELETE FROM crawls; DELETE FROM extent_state; DELETE FROM file_extents;")?;
+        .execute_batch("DELETE FROM crawls; DELETE FROM extent_state; DELETE FROM file_extents; DELETE FROM apply_mappings;")?;
     portable(index, options, stats)
 }
 
@@ -433,7 +433,15 @@ fn index_file_inner(
         tx.last_insert_rowid()
     };
     tx.execute_cached("INSERT INTO seen VALUES (?1)", [file_id])?;
-    let full = !reusable || native.is_none_or(|view| !view.cow);
+    // Provisional apply maps may outlive the filesystem transaction that
+    // produced them. With changed contents they cannot certify clean chunks.
+    // An unchanged fingerprint can still refresh them above without rehashing.
+    let provisional = tx.query_row_cached(
+        "SELECT EXISTS(SELECT 1 FROM apply_mappings WHERE file_id=?1)",
+        [file_id],
+        |r| r.get::<_, bool>(0),
+    )?;
+    let full = !reusable || provisional || native.is_none_or(|view| !view.cow);
     let dirty = if full {
         if before.len() == 0 {
             vec![]
@@ -621,7 +629,12 @@ fn index_file_inner(
     Ok(())
 }
 
-fn store_extents(tx: &rusqlite::Connection, file_id: i64, view: &NativeView) -> Result<()> {
+pub(crate) fn store_extents(
+    tx: &rusqlite::Connection,
+    file_id: i64,
+    view: &NativeView,
+) -> Result<()> {
+    tx.execute_cached("DELETE FROM apply_mappings WHERE file_id=?1", [file_id])?;
     tx.execute_cached("DELETE FROM file_extents WHERE file_id=?1", [file_id])?;
     for extent in &view.extents {
         tx.execute_cached(

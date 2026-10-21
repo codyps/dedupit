@@ -34,6 +34,102 @@ trait Source {
     fn same_tree(&mut self, a: &File, b: &File) -> Result<bool>;
 }
 struct Native;
+
+/// Capture actual kernel mappings using the already-open destination. Metadata
+/// probe failures merely retain ordinary discovery; SQL failures abort the batch.
+/// Fingerprints are guards, never refreshed to accept a concurrent writer.
+pub(crate) fn refresh_apply_mapping(
+    index: &mut Index,
+    file_id: i64,
+    file: &File,
+    fingerprint: &[u8],
+    stats: &mut Stats,
+) -> Result<()> {
+    let baseline: Option<(Vec<u8>, i64)> = index.conn.query_row_cached(
+        "SELECT e.incarnation,b.crawl_id FROM extent_state e JOIN btrfs_files b ON b.file_id=e.file_id WHERE e.file_id=?1",
+        [file_id], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    let Some((incarnation, crawl_id)) = baseline else {
+        return Ok(());
+    };
+    let capture = || -> Result<NativeView> {
+        let before = file.metadata()?;
+        ensure!(
+            scan::fingerprint(&before) == fingerprint,
+            "destination changed"
+        );
+        let item = io::inode_item(file, before.ino())?.context("inode disappeared")?;
+        let inode = Inode::parse(&item)?;
+        ensure!(
+            inode.regular() && inode.generation.to_le_bytes().as_slice() == incarnation,
+            "destination incarnation changed"
+        );
+        let extents = io::extents(file, before.ino())?
+            .into_iter()
+            .map(|e| Extent {
+                offset: e.offset,
+                length: e.length,
+                descriptor: e.descriptor,
+            })
+            .collect();
+        ensure!(
+            io::inode_item(file, before.ino())?.as_ref() == Some(&item)
+                && scan::fingerprint(&file.metadata()?) == fingerprint,
+            "destination changed during mapping capture"
+        );
+        Ok(NativeView {
+            incarnation,
+            extents,
+            cow: inode.cow(),
+            fingerprint: fingerprint.to_vec(),
+        })
+    };
+    let Ok(view) = capture() else {
+        return Ok(());
+    };
+    // Register the durability barrier before staging any provisional cache.
+    if let std::collections::hash_map::Entry::Vacant(entry) = index.mapping_sync.entry(crawl_id) {
+        entry.insert(file.try_clone()?);
+    }
+    scan::store_extents(&index.conn, file_id, &view)?;
+    index
+        .conn
+        .execute_cached("INSERT INTO apply_mappings VALUES (?1)", [file_id])?;
+    index.test_hook("apply:mapping-staged")?;
+    stats.btrfs_mapping_updates += 1;
+    Ok(())
+}
+
+/// SQLite batches can commit provisional maps before btrfs commits. Only this
+/// final, ordered barrier makes those maps eligible to suppress discovery.
+/// Read delayed inode updates after committing btrfs. Ordinary discovery queues
+/// every unrelated change before advancing its cursor/watermark. Confirmation
+/// and cursor acknowledgement share those same bounded SQLite batches.
+pub(crate) fn confirm_apply_mappings(index: &mut Index, stats: &mut Stats) -> Result<()> {
+    if index.mapping_sync.is_empty() {
+        return Ok(());
+    }
+    index.test_hook("apply:before-mapping-sync")?;
+    for (id, file) in std::mem::take(&mut index.mapping_sync) {
+        let high = io::committed(&file).context("commit btrfs before confirming apply mappings")?;
+        index.test_hook("apply:mappings-synced")?;
+        let path =
+            index
+                .conn
+                .query_row_cached("SELECT path FROM crawls WHERE id=?1", [id], |r| {
+                    Ok(decode_path(r.get(0)?))
+                })?;
+        discover_inner(
+            index,
+            &Crawl { id, file, path },
+            &mut Native,
+            stats,
+            Some(high),
+        )?;
+    }
+    index.test_hook("apply:after-mapping-confirm")?;
+    Ok(())
+}
 impl Source for Native {
     fn boundary(&mut self, file: &File) -> Result<u64> {
         io::committed(file)
@@ -226,7 +322,20 @@ fn discover(
     source: &mut impl Source,
     stats: &mut Stats,
 ) -> Result<()> {
-    let now = source.boundary(&crawl.file)?;
+    discover_inner(index, crawl, source, stats, None)
+}
+
+fn discover_inner(
+    index: &mut Index,
+    crawl: &Crawl,
+    source: &mut impl Source,
+    stats: &mut Stats,
+    confirmation: Option<u64>,
+) -> Result<()> {
+    let now = match confirmation {
+        Some(high) => high,
+        None => source.boundary(&crawl.file)?,
+    };
     let (completed, high): (u64, Option<u64>) = index.conn.query_row_cached(
         "SELECT completed,high FROM crawls WHERE id=?1",
         [crawl.id],
@@ -265,7 +374,11 @@ fn discover(
         )?;
     }
     loop {
-        index.begin_batch("discovery")?;
+        index.begin_batch(if confirmation.is_some() {
+            "mapping-confirm"
+        } else {
+            "discovery"
+        })?;
         let (low, high, cursor): (u64, u64, Vec<u8>) = index.conn.query_row_cached(
             "SELECT low,high,cursor FROM crawls WHERE id=?1",
             [crawl.id],
@@ -285,6 +398,35 @@ fn discover(
                 || !(inode.regular() || inode.directory())
             {
                 continue;
+            }
+            if confirmation.is_some() && inode.regular() {
+                let cached: Option<(i64, Vec<u8>, Vec<u8>)> = tx
+                    .query_row_cached(
+                        "SELECT a.file_id,f.fingerprint,e.incarnation FROM btrfs_files b
+                     JOIN apply_mappings a ON a.file_id=b.file_id JOIN files f ON f.id=b.file_id
+                     JOIN extent_state e ON e.file_id=b.file_id
+                     WHERE b.crawl_id=?1 AND b.ino=?2",
+                        params![crawl.id, item.key.ino],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                if let Some((file_id, fingerprint, incarnation)) = cached {
+                    if inode.generation.to_le_bytes().as_slice() == incarnation
+                        && io::matches_fingerprint(&item.data, &fingerprint)?
+                    {
+                        tx.execute_cached(
+                            "DELETE FROM apply_mappings WHERE file_id=?1",
+                            [file_id],
+                        )?;
+                        #[cfg(feature = "test-failpoints")]
+                        crate::failpoints::hit(&tx, "apply:mappings-confirmed")?;
+                        // This exact committed window is acknowledged with the
+                        // marker deletion. Future changes have a later transid;
+                        // existing queue entries are deliberately left intact.
+                        stats.btrfs_events_reused += 1;
+                        continue;
+                    }
+                }
             }
             tx.execute_cached("INSERT INTO discovery VALUES (?1,?2,?3) ON CONFLICT(crawl_id,ino) DO UPDATE SET directory=excluded.directory",params![crawl.id,item.key.ino,inode.directory()])?;
             stats.discovery_jobs += 1;
@@ -716,6 +858,7 @@ mod tests {
         path: PathBuf,
         transid: u64,
         generation: u64,
+        fingerprint: Vec<u8>,
         flags: u64,
         directory: bool,
         extents: Vec<Extent>,
@@ -748,6 +891,7 @@ mod tests {
                     path: path.into(),
                     transid: self.high,
                     generation: 1,
+                    fingerprint: scan::fingerprint(&meta),
                     flags: 0,
                     directory: meta.is_dir(),
                     extents,
@@ -768,6 +912,16 @@ mod tests {
                 .to_le_bytes(),
             );
             data[64..72].copy_from_slice(&node.flags.to_le_bytes());
+            for (start, field, length) in [
+                (16, 16, 8),
+                (136, 24, 8),
+                (144, 32, 4),
+                (124, 40, 8),
+                (132, 48, 4),
+            ] {
+                data[start..start + length]
+                    .copy_from_slice(&node.fingerprint[field..field + length]);
+            }
             data
         }
     }
@@ -896,6 +1050,80 @@ mod tests {
         fresh.verify = true;
         crate::run(&fresh, false).unwrap();
         assert_eq!(whole(options), whole(&fresh));
+    }
+
+    #[test]
+    fn confirmation_requires_a_committed_window_and_matching_fingerprint_and_preserves_queued_jobs()
+    {
+        for (confirm, changed, queued) in [
+            (true, false, false),
+            (true, true, false),
+            (false, false, false),
+            (true, false, true),
+        ] {
+            let (_dir, options, mut source, ino) = setup(Granularity::Both);
+            cycle(&options, &mut source).unwrap();
+            source.high += 1;
+            source.nodes.get_mut(&ino).unwrap().transid = source.high;
+            let (mut index, crawl) = open(&options, &source);
+            index
+                .conn
+                .execute(
+                    "INSERT INTO apply_mappings SELECT file_id FROM btrfs_files WHERE ino=?1",
+                    [ino],
+                )
+                .unwrap();
+            if queued {
+                index
+                    .conn
+                    .execute(
+                        "INSERT INTO discovery VALUES (?1,?2,0)",
+                        params![crawl.id, ino],
+                    )
+                    .unwrap();
+            }
+            if changed {
+                fs::write(source.base.join("f"), vec![42; 12288]).unwrap();
+                source.nodes.get_mut(&ino).unwrap().fingerprint =
+                    scan::fingerprint(&fs::metadata(source.base.join("f")).unwrap());
+            }
+            let mut stats = Stats::default();
+            let boundary = confirm.then_some(source.high);
+            discover_inner(&mut index, &crawl, &mut source, &mut stats, boundary).unwrap();
+            process(&mut index, &crawl, &options, &mut source, &mut stats).unwrap();
+            assert_eq!(
+                stats.files_seen,
+                u64::from(!confirm || changed || queued),
+                "{stats:?}"
+            );
+            assert_eq!(stats.btrfs_events_reused, u64::from(confirm && !changed));
+            assert_eq!(stats.bytes_hashed, if changed { 12288 } else { 0 });
+            drop(index);
+            assert_fresh_hash(&options);
+        }
+    }
+
+    #[test]
+    fn unconfirmed_maps_force_full_hash_after_a_write_even_if_maps_look_unchanged() {
+        let (_dir, options, mut source, ino) = setup(Granularity::Both);
+        cycle(&options, &mut source).unwrap();
+        let (index, _) = open(&options, &source);
+        index
+            .conn
+            .execute(
+                "INSERT INTO apply_mappings SELECT file_id FROM btrfs_files WHERE ino=?1",
+                [ino],
+            )
+            .unwrap();
+        drop(index);
+        // Model a rolled-back/reused physical mapping: it now holds different
+        // bytes despite matching the speculative descriptors. No generation
+        // event is needed: startup must queue the provisional observation.
+        fs::write(source.base.join("f"), vec![42; 12288]).unwrap();
+        let stats = cycle(&options, &mut source).unwrap();
+        assert_eq!(stats.bytes_hashed, 12288, "{stats:?}");
+        assert_eq!(stats.chunks_reused, 0);
+        assert_fresh_hash(&options);
     }
 
     #[test]

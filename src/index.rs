@@ -15,6 +15,8 @@ pub(crate) struct Index {
     pub excluded: Vec<PathBuf>,
     pub buffer: Vec<u8>,
     batch: Batch,
+    #[cfg(target_os = "linux")]
+    pub mapping_sync: std::collections::HashMap<i64, File>,
     _lock: File,
     _database: File,
 }
@@ -139,7 +141,7 @@ impl Index {
         )?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            (0..=3).contains(&version),
+            (0..=4).contains(&version),
             "unsupported index schema version {version}"
         );
         conn.execute_batch(
@@ -275,6 +277,19 @@ impl Index {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS discovery_kind ON discovery(crawl_id,directory,ino);",
         )?;
+        if version < 4 {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS apply_mappings (
+                    file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE);
+                PRAGMA user_version=4; COMMIT;",
+            )?;
+        }
+        // A process or machine crash may have preserved SQLite's provisional
+        // maps but lost btrfs's transaction. Revisit them even if that rollback
+        // leaves no new inode event. Never authorize skipping with these rows.
+        conn.execute_cached("INSERT OR IGNORE INTO discovery
+            SELECT b.crawl_id,b.ino,0 FROM apply_mappings a JOIN btrfs_files b ON b.file_id=a.file_id", [])?;
         #[cfg(feature = "test-failpoints")]
         if std::env::var_os("DEDUPIT_TEST_SMALL_CACHE").is_some() {
             // Force uncommitted WAL spill in crash tests, not just lost in-memory rows.
@@ -285,6 +300,8 @@ impl Index {
             roots: reduced,
             excluded,
             buffer: Vec::new(),
+            #[cfg(target_os = "linux")]
+            mapping_sync: std::collections::HashMap::new(),
             batch: Batch {
                 active: false,
                 phase: "",
@@ -504,6 +521,8 @@ impl Index {
             }
             self.flush_batch()?;
         }
+        #[cfg(target_os = "linux")]
+        crate::btrfs_scan::confirm_apply_mappings(self, stats)?;
         Ok(())
     }
 
@@ -592,6 +611,7 @@ impl Index {
             stats.jobs_attempted += 1;
             let mut done = 0;
             let mut complete = true;
+            let mut mapping_changed = false;
             while done < target.len {
                 let len = (target.len - done).min(16 * 1024 * 1024);
                 let result = backend.dedupe(
@@ -611,6 +631,7 @@ impl Index {
                     {
                         if matches!(result, Ok(Outcome::Shared(_))) {
                             stats.bytes_deduped += bytes;
+                            mapping_changed = true;
                         } else {
                             stats.bytes_already_shared += bytes;
                         }
@@ -663,6 +684,23 @@ impl Index {
             }
             if complete {
                 self.test_hook("apply:shared")?;
+                #[cfg(target_os = "linux")]
+                if mapping_changed {
+                    crate::btrfs_scan::refresh_apply_mapping(
+                        self,
+                        target.file_id,
+                        &destination,
+                        &target.fingerprint,
+                        stats,
+                    )?;
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = mapping_changed;
+                if !target.valid(&destination)? {
+                    self.invalidate(target.file_id)?;
+                    stats.stale += 1;
+                    return Ok(());
+                }
                 // These records are one part of the enclosing batch. Any SQL
                 // failure aborts apply and rolls the entire unfinished batch
                 // back, so no nested per-job rollback journal is needed.

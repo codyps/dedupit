@@ -294,6 +294,28 @@ fn database_hardlink_cannot_bypass_inode_lock() {
 }
 
 #[test]
+fn version_three_upgrade_preserves_hashes_and_completed_jobs() {
+    let (_dir, options) = setup(Granularity::Both);
+    put(&options, "a", &vec![1; 8192]);
+    put(&options, "b", &vec![1; 8192]);
+    let applied = run_with_backend(&options, true, &mut ComparingBackend::default()).unwrap();
+    assert!(applied.jobs_completed > 0);
+    let conn = rusqlite::Connection::open(&options.database).unwrap();
+    conn.execute_batch("DROP TABLE apply_mappings; PRAGMA user_version=3;")
+        .unwrap();
+    drop(conn);
+    let resumed = run_with_backend(&options, true, &mut ComparingBackend::default()).unwrap();
+    assert_eq!(resumed.bytes_hashed, 0);
+    assert_eq!(resumed.jobs_attempted, 0);
+    let conn = rusqlite::Connection::open(&options.database).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
+            .unwrap(),
+        4
+    );
+}
+
+#[test]
 fn version_one_index_migrates_without_rehashing_portable_files() {
     let (_dir, options) = setup(Granularity::Both);
     put(&options, "a", &vec![1; 4096]);
@@ -311,7 +333,7 @@ fn version_one_index_migrates_without_rehashing_portable_files() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
 }
 
@@ -370,7 +392,7 @@ fn old_zero_chunk_candidates_migrate_without_reading_files() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
 }
 

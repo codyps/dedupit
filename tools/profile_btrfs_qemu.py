@@ -24,7 +24,8 @@ spec.loader.exec_module(helpers)
 
 
 REPEATED = {'idle-before-apply', 'idle-after-apply', 'idle-after-changes',
-            'small-file-write-apply', 'large-file-4k-write-apply', 'new-duplicate-apply'}
+            'small-file-write-apply', 'large-file-4k-write-apply', 'new-duplicate-apply',
+            'post-new-duplicate-reconcile'}
 REQUIRED = REPEATED | {'initial-native-index', 'initial-apply', 'post-apply-reconcile',
                        'representative-write-apply', 'post-change-reconcile', 'oracle-full-scan'}
 
@@ -49,7 +50,7 @@ def validate(report, serial, returncode, files, repetitions):
         if sample['case'] != 'oracle-full-scan' and (
                 stats['btrfs_subvolumes'] <= 0 or stats['scanner_fallbacks']):
             raise RuntimeError('benchmark must use native btrfs discovery')
-        if sample['case'].startswith('idle-') and any(stats[key] for key in
+        if (sample['case'].startswith('idle-') or sample['case'].endswith('-reconcile')) and any(stats[key] for key in
                 ['files_seen', 'files_hashed', 'bytes_hashed', 'jobs_attempted', 'discovery_jobs']):
             raise RuntimeError('idle sample performed old-file work')
     if result.get('initial_deduped_bytes', 0) <= 0:

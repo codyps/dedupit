@@ -54,6 +54,8 @@ pub struct Stats {
     pub database_batches: u64,
     pub btrfs_subvolumes: u64,
     pub btrfs_search_pages: u64,
+    pub btrfs_mapping_updates: u64,
+    pub btrfs_events_reused: u64,
     pub discovery_jobs: u64,
     pub chunks_reused: u64,
     pub scanner_fallbacks: Vec<String>,

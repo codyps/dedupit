@@ -57,7 +57,8 @@ fn durable_state(database: &Path) -> (Value, blake3::Hash) {
             .unwrap()
     };
     let counts = serde_json::json!({"files":count("files"), "completed":count("completed"),
-        "ranges":count("ranges"), "discovery":count("discovery")});
+        "ranges":count("ranges"), "discovery":count("discovery"), "apply_mappings":count("apply_mappings"),
+        "unconfirmed":count("apply_mappings")});
     let mut hash = blake3::Hasher::new();
     for table in [
         "files",
@@ -65,6 +66,7 @@ fn durable_state(database: &Path) -> (Value, blake3::Hash) {
         "chunk_cache",
         "file_extents",
         "extent_state",
+        "apply_mappings",
         "completed",
         "crawls",
         "discovery",
@@ -172,7 +174,16 @@ pub(super) fn crash_at(case: &Crash<'_>) -> Observation {
         thread::sleep(Duration::from_millis(5));
     };
     assert_eq!(staged["event"], case.event);
-    assert_eq!(staged["autocommit"], case.event.ends_with("after-commit"));
+    assert_eq!(
+        staged["autocommit"],
+        case.event.ends_with("after-commit")
+            || matches!(
+                case.event,
+                "apply:before-mapping-sync"
+                    | "apply:mappings-synced"
+                    | "apply:after-mapping-confirm"
+            )
+    );
     let (durable, before) = durable_state(case.database);
     let uncommitted_frames = uncommitted_frames(case.database);
     child.0.kill().unwrap();
@@ -478,4 +489,143 @@ fn apply_batches_replay_only_uncommitted_completions_and_preserve_cow_contents()
         }
         verify(&options, &contents);
     }
+}
+
+#[test]
+fn apply_mapping_cache_recovers_before_and_after_filesystem_confirmation() {
+    for event in [
+        "apply:mapping-staged",
+        "apply:before-mapping-sync",
+        "apply:mappings-synced",
+        "apply:mappings-confirmed",
+        "mapping-confirm:before-commit",
+        "mapping-confirm:after-commit",
+        "apply:after-mapping-confirm",
+    ] {
+        let Some((_dir, options, mut contents)) = fixture(false) else {
+            return;
+        };
+        run(&options, false);
+        let observation = crash_at(&Crash {
+            database: &options.database,
+            root: &options.roots[0],
+            portable: false,
+            apply: true,
+            event,
+            hit: if event == "apply:mapping-staged" {
+                3
+            } else {
+                1
+            },
+            batch_size: 64,
+        });
+        let durable = observation.durable["completed"].as_u64().unwrap();
+        let downtime_write = event == "apply:mappings-synced";
+        if downtime_write {
+            let path = options.roots[0].join("file-001");
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .write_all_at(&[71; 32], 0)
+                .unwrap();
+            contents.get_mut(&path).unwrap()[..32].fill(71);
+        }
+        if event == "apply:after-mapping-confirm" {
+            assert_eq!(observation.durable["unconfirmed"], 0);
+            let idle = run(&options, true);
+            assert_eq!(
+                idle["files_seen"], 0,
+                "confirmed mapping must survive restart"
+            );
+            assert_eq!(idle["jobs_completed"], 0);
+        } else {
+            let resumed = run(&options, true);
+            if downtime_write {
+                assert!(resumed["bytes_hashed"].as_u64().unwrap() > 0);
+            } else {
+                assert_eq!(resumed["jobs_completed"].as_u64().unwrap(), 129 - durable);
+            }
+        }
+        // A write after recovery must still be discovered. Changing the original
+        // representative also exercises requeuing its completed dependents.
+        let path = options.roots[0].join("file-000");
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all_at(&[99; 32], 0)
+            .unwrap();
+        contents.get_mut(&path).unwrap()[..32].fill(99);
+        run(&options, true);
+        verify(&options, &contents);
+    }
+}
+
+#[test]
+fn apply_mapping_confirmation_does_not_hide_concurrent_writes_or_namespace_changes() {
+    let Some((_dir, options, mut contents)) = fixture(false) else {
+        return;
+    };
+    run(&options, false);
+    let marker = options.database.with_file_name("paused.json");
+    let log = options.database.with_file_name("paused.log");
+    let output = File::create(&log).unwrap();
+    let mut child = ChildGuard(
+        cli(&options, true)
+            .env("DEDUPIT_TEST_FAILPOINT", "apply:before-mapping-sync")
+            .env("DEDUPIT_TEST_ACTION", "pause")
+            .env("DEDUPIT_TEST_READY", &marker)
+            .stdout(Stdio::from(output.try_clone().unwrap()))
+            .stderr(Stdio::from(output))
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{}",
+            fs::read_to_string(&log).unwrap()
+        );
+        if fs::read_to_string(format!("/proc/{}/status", child.0.id()))
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.starts_with("State:\tT"))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "apply did not pause");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let changed = options.roots[0].join("file-001");
+    OpenOptions::new()
+        .write(true)
+        .open(&changed)
+        .unwrap()
+        .write_all_at(&[71; 32], 0)
+        .unwrap();
+    contents.get_mut(&changed).unwrap()[..32].fill(71);
+    let created = options.roots[0].join("new-during-apply");
+    let bytes = data(8192);
+    fs::write(&created, &bytes).unwrap();
+    contents.insert(created, bytes);
+    let old = options.roots[0].join("file-005");
+    let renamed = options.roots[0].join("renamed-during-apply");
+    fs::rename(&old, &renamed).unwrap();
+    let moved = contents.remove(&old).unwrap();
+    contents.insert(renamed, moved);
+    // SAFETY: this is the stopped child owned by ChildGuard, not another process.
+    assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGCONT) }, 0);
+    assert!(
+        child.0.wait().unwrap().success(),
+        "{}",
+        fs::read_to_string(&log).unwrap()
+    );
+    let next = run(&options, true);
+    assert!(
+        next["bytes_hashed"].as_u64().unwrap() >= 4096 + 8192,
+        "{next}"
+    );
+    verify(&options, &contents);
 }

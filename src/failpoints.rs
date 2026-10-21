@@ -39,6 +39,8 @@ pub(crate) fn hit(conn: &Connection, event: &str) -> Result<()> {
             "event": event, "pid": std::process::id(), "autocommit": conn.is_autocommit(),
             "files": count("files")?, "ranges": count("ranges")?,
             "completed": count("completed")?, "discovery": count("discovery")?,
+            "apply_mappings": count("apply_mappings")?,
+            "unconfirmed": count("apply_mappings")?,
         }),
     )?;
     marker.write_all(b"\n")?;
@@ -47,6 +49,9 @@ pub(crate) fn hit(conn: &Connection, event: &str) -> Result<()> {
     // verifies the stopped state and delivers SIGKILL; no host privilege needed.
     unsafe {
         libc::raise(libc::SIGSTOP);
+    }
+    if std::env::var("DEDUPIT_TEST_ACTION").as_deref() == Ok("pause") {
+        return Ok(());
     }
     bail!("test failpoint unexpectedly resumed")
 }

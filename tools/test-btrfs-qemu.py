@@ -103,6 +103,9 @@ def validate_guest(serial, returncode, expected_tests):
 
 
 REQUIRED_BATCH_TESTS = {
+    "native_apply_caches_mappings_without_refresh_and_keeps_writes_incremental",
+    "batch_crashes::apply_mapping_cache_recovers_before_and_after_filesystem_confirmation",
+    "batch_crashes::apply_mapping_confirmation_does_not_hide_concurrent_writes_or_namespace_changes",
     "batch_crashes::failed_file_cleanup_keeps_batch_neighbors_and_cleanup_failure_aborts_the_batch",
     "batch_crashes::portable_batches_recover_uncommitted_spilled_wal_and_keep_committed_files",
     "batch_crashes::native_batches_keep_discovery_cursors_and_hash_acknowledgements_atomic",
@@ -127,7 +130,7 @@ def main():
     parser.add_argument("--busybox", required=True, help="static BusyBox executable")
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--cargo", default="cargo")
-    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--log", type=Path, default=Path("target/btrfs-qemu.log"))
     parser.add_argument("--stress-seed", type=int, help="replay one stress seed (decimal u64)")
     parser.add_argument("--stress-rounds", type=int, default=16,

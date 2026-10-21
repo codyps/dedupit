@@ -68,3 +68,10 @@ class ProfileValidationTests(unittest.TestCase):
                              ('DEDUPIT_GUEST_EXIT=0\n', 1)]:
             with self.subTest(serial=serial, code=code), self.assertRaises(RuntimeError):
                 validate(copy.deepcopy(report()), serial, code, 1024, 3)
+
+    def test_post_apply_catchup_cannot_hide_mapping_refresh(self):
+        for name in ['post-apply-reconcile', 'post-new-duplicate-reconcile', 'post-change-reconcile']:
+            data = report()
+            next(s for s in data['samples'] if s['case'] == name)['stats']['files_seen'] = 1
+            with self.subTest(case=name), self.assertRaises(RuntimeError):
+                validate(data, 'DEDUPIT_GUEST_EXIT=0\n', 0, 1024, 3)

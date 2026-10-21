@@ -180,16 +180,9 @@ impl Bench<'_> {
         Ok(())
     }
     fn settle(&mut self, case: &str) -> Result<()> {
-        for _ in 0..5 {
-            let stats = self.native(case, true)?;
-            if number(&stats, "files_seen")? == 0
-                && number(&stats, "bytes_hashed")? == 0
-                && number(&stats, "jobs_attempted")? == 0
-            {
-                return Ok(());
-            }
-        }
-        bail!("native discovery did not become idle; all catch-up samples were recorded")
+        // Mapping capture in apply must make the FIRST following invocation
+        // idle. Extra settling passes would hide a performance regression.
+        self.idle(case, true)
     }
 }
 fn digest(database: &Path) -> Result<String> {
