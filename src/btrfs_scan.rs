@@ -94,7 +94,7 @@ pub(crate) fn scan(index: &mut Index, options: &Options, stats: &mut Stats) -> R
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for id in stale.into_iter().filter(|id| !ids.contains(id)) {
-        let tx = index.conn.transaction()?;
+        let tx = index.conn.savepoint()?;
         stats.files_removed += tx.execute_cached(
             "DELETE FROM files WHERE id IN (SELECT file_id FROM btrfs_files WHERE crawl_id=?1)",
             [id],
@@ -235,7 +235,7 @@ fn discover(
     if now < completed || high.is_some_and(|high| now < high) {
         // Restored/rolled-back filesystem: a previous extent baseline cannot
         // certify data on the new timeline, even if an inode number repeats.
-        let tx = index.conn.transaction()?;
+        let tx = index.conn.savepoint()?;
         tx.execute_cached(
             "DELETE FROM files WHERE id IN (SELECT file_id FROM btrfs_files WHERE crawl_id=?1)",
             [crawl.id],
@@ -265,6 +265,7 @@ fn discover(
         )?;
     }
     loop {
+        index.begin_batch("discovery")?;
         let (low, high, cursor): (u64, u64, Vec<u8>) = index.conn.query_row_cached(
             "SELECT low,high,cursor FROM crawls WHERE id=?1",
             [crawl.id],
@@ -273,7 +274,7 @@ fn discover(
         let key = Key::decode(&cursor)?;
         let page = source.page(&crawl.file, key, low)?;
         stats.btrfs_search_pages += 1;
-        let tx = index.conn.transaction()?;
+        let tx = index.conn.savepoint()?;
         for item in &page {
             if item.key.kind != io::INODE {
                 continue;
@@ -293,6 +294,8 @@ fn discover(
             // durable, including jobs that fail processing and need later retry.
             tx.execute_cached("UPDATE crawls SET completed=high,low=NULL,high=NULL,cursor=NULL,enumerated=1 WHERE id=?1",[crawl.id])?;
             tx.commit()?;
+            index.batch_step(page.iter().map(|item| item.data.len() as u64).sum())?;
+            index.flush_batch()?;
             if high < now {
                 // Finish a resumed older window, then catch up through the
                 // boundary captured at this invocation's start. Do not chase
@@ -312,6 +315,7 @@ fn discover(
             params![crawl.id, next.encode()],
         )?;
         tx.commit()?;
+        index.batch_step(page.iter().map(|item| item.data.len() as u64).sum())?;
     }
 }
 
@@ -338,11 +342,25 @@ fn process(
             index
                 .conn
                 .execute_cached("INSERT INTO attempted VALUES (?1)", [ino])?;
+            index.begin_batch(if directory {
+                "native-directory"
+            } else {
+                "native-file"
+            })?;
+            let bytes_before = stats.bytes_hashed;
+            // The entire observation (including file identity and queue ack)
+            // belongs to one batch. Roll back a failed job's partial directory
+            // edits without discarding earlier successful jobs in this batch.
+            index.conn.execute_batch("SAVEPOINT discovery_job")?;
             let result = if directory {
                 directory_job(index, crawl, ino as u64, source, initial)
             } else {
                 file_job(index, crawl, ino as u64, options, source, stats)
             };
+            if result.is_err() {
+                index.conn.execute_batch("ROLLBACK TO discovery_job")?;
+            }
+            index.conn.execute_batch("RELEASE discovery_job")?;
             if let Err(error) = result {
                 stats
                     .errors
@@ -358,6 +376,7 @@ fn process(
                     params![crawl.id, ino],
                 )?;
             }
+            index.batch_step(stats.bytes_hashed.saturating_sub(bytes_before))?;
         }
         if directory {
             // Failed bootstrap directory jobs remain queued. Subsequent cycles
@@ -367,6 +386,7 @@ fn process(
                 [crawl.id],
             )?;
         }
+        index.flush_batch()?;
     }
     Ok(())
 }
@@ -571,7 +591,7 @@ fn move_directories(index: &mut Index, crawl: i64, old: &Path, new: Option<&Path
         )?
         .query_map(params![crawl, prefix, end], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let tx = index.conn.transaction()?;
+    let tx = index.conn.savepoint()?;
     for (ino, bytes) in dirs {
         if let Some(new) = new {
             let previous = decode_path(bytes);
@@ -758,6 +778,7 @@ mod tests {
             granularity,
             verify: false,
             scanner: Scanner::Btrfs,
+            commit_batch_size: 64,
         };
         let mut source = Fake::new(base);
         source.add("", vec![]);
@@ -810,7 +831,8 @@ mod tests {
 
     #[test]
     fn resumes_metadata_cursor_and_durable_queue_after_restart() {
-        let (_dir, options, mut source, _) = setup(Granularity::Both);
+        let (_dir, mut options, mut source, _) = setup(Granularity::Both);
+        options.commit_batch_size = 1;
         source.fail_at = Some(2);
         assert!(cycle(&options, &mut source).is_err());
         let (index, _) = open(&options, &source);
@@ -835,6 +857,31 @@ mod tests {
         assert!(source.calls.is_empty());
         assert_eq!(idle.files_seen, 0);
         assert_eq!(idle.bytes_hashed, 0);
+    }
+
+    #[test]
+    fn uncommitted_metadata_pages_replay_with_their_queue_after_restart() {
+        let (_dir, options, mut source, _) = setup(Granularity::Both);
+        source.fail_at = Some(2);
+        assert!(cycle(&options, &mut source).is_err());
+        let (index, _) = open(&options, &source);
+        let saved: Vec<u8> = index
+            .conn
+            .query_row("SELECT cursor FROM crawls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(Key::decode(&saved).unwrap(), Key::FIRST);
+        let queued: u64 = index
+            .conn
+            .query_row("SELECT COUNT(*) FROM discovery", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0);
+        drop(index);
+        source.fail_at = None;
+        source.calls.clear();
+        let resumed = cycle(&options, &mut source).unwrap();
+        assert_eq!(source.calls[0], Key::FIRST);
+        assert_eq!(resumed.bytes_hashed, 12288);
+        assert_fresh_hash(&options);
     }
 
     #[test]

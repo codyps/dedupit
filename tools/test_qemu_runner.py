@@ -46,6 +46,13 @@ class GuestValidationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             runner.validate_guest(serial(passed=0), 0, 0)
 
+    def test_missing_batch_crash_feature_or_test_fails(self):
+        listing = "\n".join(name + ": test" for name in runner.REQUIRED_BATCH_TESTS)
+        self.assertEqual(runner.validate_listing(listing), 3)
+        for output in ["", "ordinary_discovery: test", listing.split("\n", 1)[1]]:
+            with self.subTest(output=output), self.assertRaises(RuntimeError):
+                runner.validate_listing(output)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -243,9 +243,12 @@ fn portable(index: &mut Index, options: &Options, stats: &mut Stats) -> Result<(
                 continue;
             }
             stats.files_seen += 1;
+            index.begin_batch("portable")?;
+            let bytes_before = stats.bytes_hashed;
             if let Err(error) = index_file(index, entry.path(), options, stats, &excluded_ids, None)
             {
-                // Never leave old hashes usable after a failed scan of a path.
+                index.begin_batch("portable")?; // reject an automatic SQLite rollback
+                                                // Never leave old hashes usable after a failed scan of a path.
                 index.conn.execute(
                     "DELETE FROM files WHERE path=?1",
                     [path_bytes(entry.path())],
@@ -254,8 +257,10 @@ fn portable(index: &mut Index, options: &Options, stats: &mut Stats) -> Result<(
                     .errors
                     .push(format!("scan {:?}: {error:#}", entry.path()));
             }
+            index.batch_step(stats.bytes_hashed.saturating_sub(bytes_before))?;
         }
     }
+    index.flush_batch()?;
     // A traversal error must not make an unreadable subtree look deleted.
     if traversal_complete {
         stats.files_removed = index.conn.execute(
@@ -341,7 +346,7 @@ pub(crate) fn index_file(
                 .conn
                 .execute_cached("INSERT INTO seen VALUES (?1)", [id])?;
             if let Some(view) = native {
-                let tx = index.conn.transaction()?;
+                let tx = index.conn.savepoint()?;
                 store_extents(&tx, *id, view)?;
                 tx.commit()?;
             }
@@ -349,7 +354,7 @@ pub(crate) fn index_file(
             return Ok(());
         }
     }
-    let tx = index.conn.transaction()?;
+    let tx = index.conn.savepoint()?;
     // A name may now refer to a different inode. Invalidate it atomically with
     // insertion/rename of the current inode's row.
     tx.execute_cached(
@@ -570,7 +575,7 @@ pub(crate) fn index_file(
     Ok(())
 }
 
-fn store_extents(tx: &rusqlite::Transaction<'_>, file_id: i64, view: &NativeView) -> Result<()> {
+fn store_extents(tx: &rusqlite::Connection, file_id: i64, view: &NativeView) -> Result<()> {
     tx.execute_cached("DELETE FROM file_extents WHERE file_id=?1", [file_id])?;
     for extent in &view.extents {
         tx.execute_cached(

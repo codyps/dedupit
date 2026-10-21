@@ -11,7 +11,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked --all-targets
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets --all-features
       - name: Test QEMU result validation
         run: python3 -m unittest discover -s tools -p 'test_*.py'
 

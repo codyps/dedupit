@@ -6,6 +6,9 @@ use std::{
     path::Path,
 };
 
+#[cfg(feature = "test-failpoints")]
+#[path = "support/batch_crashes.rs"]
+mod batch_crashes;
 #[path = "support/btrfs_stress.rs"]
 mod stress;
 
@@ -20,6 +23,7 @@ fn setup() -> (tempfile::TempDir, Options) {
         granularity: Granularity::Both,
         verify: false,
         scanner: Scanner::Btrfs,
+        commit_batch_size: 64,
     };
     (dir, options)
 }

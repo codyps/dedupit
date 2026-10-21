@@ -6,6 +6,10 @@ rust-version = "1.85"
 description = "Incremental file and extent deduplication with kernel-verified sharing"
 license = "MIT"
 
+[features]
+# Deterministic process-stop hooks used only by crash tests, never enabled by default.
+test-failpoints = []
+
 [dependencies]
 anyhow = "1"
 blake3 = "1"

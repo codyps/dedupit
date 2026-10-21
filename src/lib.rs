@@ -6,6 +6,8 @@ pub mod backend;
 mod btrfs_io;
 #[cfg(target_os = "linux")]
 mod btrfs_scan;
+#[cfg(feature = "test-failpoints")]
+mod failpoints;
 mod index;
 mod scan;
 
@@ -42,10 +44,14 @@ pub struct Options {
     /// Re-read every file, even when its metadata fingerprint is unchanged.
     pub verify: bool,
     pub scanner: Scanner,
+    /// Operations per durable database batch (1..=4096). May change on restart.
+    pub commit_batch_size: usize,
 }
 
 #[derive(Debug, Default, Serialize)]
 pub struct Stats {
+    /// Explicit scan/apply batch commits, excluding startup and maintenance SQL.
+    pub database_batches: u64,
     pub btrfs_subvolumes: u64,
     pub btrfs_search_pages: u64,
     pub discovery_jobs: u64,
@@ -110,12 +116,19 @@ pub fn run_with_backend(
         "chunk size must be a power of two between 4096 and 16777216"
     );
     ensure!(!options.roots.is_empty(), "at least one root is required");
+    ensure!(
+        (1..=4096).contains(&options.commit_batch_size),
+        "commit batch size must be between 1 and 4096"
+    );
     let mut index = index::Index::open(options)?;
     let mut stats = Stats::default();
     scan::scan(&mut index, options, &mut stats).context("scanning files")?;
+    index.flush_batch()?;
     index.summarize(&mut stats)?;
     if apply {
         index.apply(backend, &mut stats)?;
     }
+    index.flush_batch()?;
+    stats.database_batches = index.batch_commits();
     Ok(stats)
 }

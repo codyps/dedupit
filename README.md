@@ -60,6 +60,25 @@ Default chunk size is 128 KiB. Supported sizes are powers of two from 4 KiB to
 space, hashing, and ioctl calls. There is no background service: schedule the
 same command periodically for continuous incremental operation.
 
+Database commits default to **64 operations per batch**. Batches also flush
+after 64 MiB of processed data or one second, checked between atomic operations;
+a single large file, directory job, metadata page, or sharing job can exceed
+those budgets. `--commit-batch-size 1` selects individual operation commits;
+values through 4096 are supported. The policy can change when restarting the
+same index. SQLite remains in WAL mode with `synchronous=FULL`.
+
+Each file update uses a [savepoint](https://www.sqlite.org/lang_savepoint.html)
+inside the batch. A failed file rolls back its partial hashes while earlier
+successful files can still commit. Btrfs hashes, identity/mapping records, and
+their queue acknowledgements commit together. Discovery cursors and the work
+they enqueue also commit together. Apply completion records are staged only
+after the kernel reports success and file identities are revalidated. A process
+crash discards the unfinished batch: discovery/hashing repeats its uncommitted
+operations, and apply safely repeats sharing whose completion did not commit.
+Previously committed batches remain reusable. Phase boundaries and normal exit
+flush the final batch; fatal errors and unwinding roll it back. Batching trades
+bounded repeated work after a crash for fewer synchronous commits.
+
 `--verify` ignores metadata caching and rehashes everything. Use it periodically,
 after restoring an index, or for filesystems with coarse/unreliable timestamps.
 It also reconsiders successful work; physical layout changes made by external
@@ -96,9 +115,9 @@ The btrfs scanner follows the generation-filtered crawl model used by
   active window. A page's discovered inode jobs and next cursor commit together.
 * After a restart, an unfinished metadata search resumes at its saved key.
   Enumeration may advance the watermark once its work is durably queued; failed
-  file jobs remain independently retryable. Hashing acknowledges a job only after
-  its stable per-file transaction commits. An interruption during hashing can
-  repeat the unfinished file, but not previously completed files.
+  file jobs remain independently retryable. Stable hashes and queue
+  acknowledgements become durable in the same batch. An interruption can repeat
+  operations in the unfinished batch; earlier committed batches are preserved.
 * Changed COW files compare their old and new extent mappings. Only affected
   aligned chunks are reread, including truncation/EOF boundaries and newly
   allocated data. Splitting a large extent around a small write preserves the
@@ -128,7 +147,7 @@ The portable fallback works as follows:
   metadata checks but no content reads. Unchanged observations use a temporary
   table, avoiding a durable database write/fsync per file.
 * Changed files are hashed with one reusable chunk buffer. Their old range
-  records are replaced in a single transaction only after verifying stable
+  records are replaced under a per-file savepoint only after verifying stable
   descriptor metadata and path identity. Interrupted or unstable scans cannot
   commit a partially hashed file. A changed file is read in full; this does not
   require filesystem change journals or kernel-specific dirty-block tracking.
@@ -260,10 +279,11 @@ use a bounded prepared-statement cache; hashing reuses scratch storage and reads
 cached hashes directly. Linux uses `openat2` with
 [`RESOLVE_NO_SYMLINKS`](https://man7.org/linux/man-pages/man2/openat2.2.html)
 to validate every path component in one call where supported, retaining the
-component-by-component fallback. Durable per-file/per-job commits and identity
-validation remain in place. Initial scans and apply can still be dominated by
-filesystem sync latency; hashing and index insertion dominate dense small-chunk
-scans. Use CPU/heap profilers separately from wall-time benchmarks.
+component-by-component fallback. Bounded database batches reduce filesystem
+sync overhead while retaining atomic file/job updates and identity validation.
+`--commit-batch-size 1` is available for comparing commit policies. Hashing and
+index insertion dominate dense small-chunk scans. Use CPU/heap profilers
+separately from wall-time benchmarks.
 
 ## Validation
 
@@ -309,15 +329,32 @@ operations). It covers copies, writes, appends, truncation/extension, sparse wri
 hole punching, hardlinks, symlinks, file/directory renames and deletions, moves
 across the scan boundary, atomic replacement, non-UTF-8 names, empty files and
 sizes around chunk boundaries. Each scan
-starts a new CLI process. Every fourth round attempts to kill a process after
-observing committed discovery jobs, makes additional changes while dedupit is
-stopped, then resumes from the same database; each seed must exercise an interruption.
+starts a new CLI process. Every fourth round stops and kills a process inside
+an uncommitted native file batch after a previous batch committed, makes
+additional changes while dedupit is stopped, then resumes from the same database;
+each seed must exercise an interruption.
 Every round also runs `--apply`. Controlled incompressible files require both
 whole-file and partial-range jobs to complete, followed by writes to the shared
 sources to verify independent copy-on-write behavior. On another four-round
-cycle the test kills an apply process after observing new completed jobs while
-pending work remains, modifies files during downtime, and resumes `--apply`;
+cycle the test kills an apply process with new completion records staged inside
+an unfinished batch, modifies files during downtime, and resumes `--apply`;
 each seed must exercise an apply interruption too.
+
+Three additional tests exercise 13 deterministic crash cases: portable scans
+with spilled uncommitted WAL pages, btrfs discovery cursors and hash/queue
+acknowledgements, and apply before/after commits and between kernel sharing and
+database acknowledgement. An independent reader captures the complete durable
+database state while the child is stopped; recovery must reproduce that state
+exactly, including hashes, queue entries, cursors and completion records. Restart
+checks prove committed files/jobs are reused, reconcile downtime mutations,
+compare against a fresh full scan, verify contents and copy-on-write isolation,
+and check SQLite integrity/foreign keys. Random stress uses two-operation
+batches; the deterministic cases use the default 64-operation batches.
+
+The QEMU runner builds with the `test-failpoints` feature and requires all three
+batch crash tests in the compiled test listing, so omission of the feature or a
+required test fails CI. Stop hooks and the tiny SQLite cache used to force WAL
+spill exist only in that opt-in test build; normal builds contain neither.
 
 An independent in-memory model records expected bytes, file identities,
 hardlink aliases, copies, sparse extension, hole punching, renames, deletions,

@@ -7,18 +7,21 @@ use std::{
     cell::RefCell,
     collections::BTreeMap,
     ffi::OsString,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::Read,
     os::{
         fd::AsRawFd,
-        unix::{
-            ffi::OsStringExt, fs::symlink, fs::FileExt, fs::MetadataExt, fs::OpenOptionsExt,
-            process::ExitStatusExt,
-        },
+        unix::{ffi::OsStringExt, fs::symlink, fs::FileExt, fs::MetadataExt, fs::OpenOptionsExt},
     },
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     rc::Rc,
+};
+#[cfg(not(feature = "test-failpoints"))]
+use std::{
+    fs::File,
+    os::unix::process::ExitStatusExt,
+    process::Stdio,
     thread,
     time::{Duration, Instant},
 };
@@ -264,6 +267,8 @@ impl Workload {
         // partial-range sharing, regardless of the random workload's duplicates.
         let whole: Vec<_> = (0..65536).map(|_| random.next() as u8).collect();
         self.store_file(&controls.join("whole-a"), whole.clone());
+        self.store_file(&controls.join("whole-c"), whole.clone());
+        self.store_file(&controls.join("whole-d"), whole.clone());
         self.store_file(&controls.join("whole-b"), whole);
         let first: Vec<_> = (0..12288).map(|_| random.next() as u8).collect();
         let mut second: Vec<_> = (0..12288).map(|_| random.next() as u8).collect();
@@ -449,6 +454,7 @@ fn command(database: &Path, root: &Path, portable: bool, apply: bool) -> Command
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_dedupit"));
     cmd.arg("--database")
         .arg(database)
+        .args(["--commit-batch-size", "2"])
         .args(["--json", "--chunk-size", "4096", "--scanner"])
         .arg(if portable { "portable" } else { "btrfs" });
     if portable {
@@ -460,7 +466,7 @@ fn command(database: &Path, root: &Path, portable: bool, apply: bool) -> Command
     cmd.arg(root);
     cmd
 }
-fn run(database: &Path, root: &Path, portable: bool, apply: bool) -> Value {
+pub(super) fn run(database: &Path, root: &Path, portable: bool, apply: bool) -> Value {
     let output = command(database, root, portable, apply).output().unwrap();
     assert!(
         output.status.success(),
@@ -478,6 +484,41 @@ fn run(database: &Path, root: &Path, portable: bool, apply: bool) -> Value {
     stats
 }
 
+#[cfg(feature = "test-failpoints")]
+fn interrupt(database: &Path, root: &Path, _log: &Path, apply: bool) -> bool {
+    let observation = super::batch_crashes::crash_at(&super::batch_crashes::Crash {
+        database,
+        root,
+        portable: false,
+        apply,
+        batch_size: 2,
+        hit: 3,
+        event: if apply {
+            "apply:staged"
+        } else {
+            "native-file:staged"
+        },
+    });
+    assert_eq!(observation.staged["autocommit"], false);
+    if apply {
+        assert!(
+            observation.staged["completed"].as_u64().unwrap()
+                > observation.durable["completed"].as_u64().unwrap()
+        );
+    } else {
+        assert!(
+            observation.staged["discovery"].as_u64().unwrap()
+                < observation.durable["discovery"].as_u64().unwrap()
+        );
+    }
+    eprintln!(
+        "  killed inside uncommitted {} batch after a previous batch committed",
+        if apply { "apply" } else { "native-file" }
+    );
+    true
+}
+
+#[cfg(not(feature = "test-failpoints"))]
 fn interrupt(database: &Path, root: &Path, log: &Path, apply: bool) -> bool {
     let observer = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     observer.busy_timeout(Duration::from_millis(50)).unwrap();
@@ -571,11 +612,11 @@ fn interrupt(database: &Path, root: &Path, log: &Path, apply: bool) -> bool {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct IndexedFile {
+pub(super) struct IndexedFile {
     fingerprint: Vec<u8>,
     ranges: Vec<(u32, u64, u64, Vec<u8>)>,
 }
-fn inventory(database: &Path, root: &Path) -> BTreeMap<(u64, u64), IndexedFile> {
+pub(super) fn inventory(database: &Path, root: &Path) -> BTreeMap<(u64, u64), IndexedFile> {
     let conn = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     assert_eq!(
         conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))

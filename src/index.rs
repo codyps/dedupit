@@ -6,6 +6,7 @@ use std::{
     fs::{self, File, OpenOptions},
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 pub(crate) struct Index {
@@ -13,13 +14,27 @@ pub(crate) struct Index {
     pub roots: Vec<PathBuf>,
     pub excluded: Vec<PathBuf>,
     pub buffer: Vec<u8>,
+    batch: Batch,
     _lock: File,
     _database: File,
 }
 
+// Only flush_batch commits the outer transaction. Dropping Index on an error
+// or panic lets SQLite roll it back; releasing a file/job savepoint never makes
+// that operation durable independently of its batch.
+struct Batch {
+    active: bool,
+    phase: &'static str,
+    started: Instant,
+    operations: usize,
+    bytes: u64,
+    limit: usize,
+    commits: u64,
+}
+
 /// Repeated scan/job statements share a bounded connection-local cache, also
-/// through Transaction's deref. Dropping a cached statement resets it and clears
-/// its bindings before reuse; transaction boundaries and durability are unchanged.
+/// through transactions and savepoints. Dropping a cached statement resets it
+/// and clears bindings before reuse; these helpers do not alter transaction boundaries.
 pub(crate) trait SqlCache {
     fn execute_cached(&self, sql: &str, params: impl Params) -> rusqlite::Result<usize>;
     fn query_row_cached<T>(
@@ -254,14 +269,98 @@ impl Index {
             tx.pragma_update(None, "user_version", 3)?;
             tx.commit()?;
         }
+        #[cfg(feature = "test-failpoints")]
+        if std::env::var_os("DEDUPIT_TEST_SMALL_CACHE").is_some() {
+            // Force uncommitted WAL spill in crash tests, not just lost in-memory rows.
+            conn.pragma_update(None, "cache_size", 8)?;
+        }
         Ok(Self {
             conn,
             roots: reduced,
             excluded,
             buffer: Vec::new(),
+            batch: Batch {
+                active: false,
+                phase: "",
+                started: Instant::now(),
+                operations: 0,
+                bytes: 0,
+                limit: options.commit_batch_size,
+                commits: 0,
+            },
             _lock: lock,
             _database: db_file,
         })
+    }
+
+    pub fn begin_batch(&mut self, phase: &'static str) -> Result<()> {
+        if self.batch.active {
+            ensure!(
+                !self.conn.is_autocommit(),
+                "database batch was unexpectedly rolled back"
+            );
+            ensure!(
+                self.batch.phase == phase,
+                "database batch crossed a phase boundary"
+            );
+        } else {
+            ensure!(
+                self.conn.is_autocommit(),
+                "unexpected open database transaction"
+            );
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            self.batch.active = true;
+            self.batch.phase = phase;
+            self.batch.started = Instant::now();
+            self.batch.operations = 0;
+            self.batch.bytes = 0;
+        }
+        Ok(())
+    }
+
+    pub fn batch_step(&mut self, bytes: u64) -> Result<()> {
+        ensure!(
+            self.batch.active && !self.conn.is_autocommit(),
+            "database batch was unexpectedly rolled back"
+        );
+        self.batch.operations += 1;
+        self.batch.bytes = self.batch.bytes.saturating_add(bytes);
+        #[cfg(feature = "test-failpoints")]
+        self.test_hook(&format!("{}:staged", self.batch.phase))?;
+        // Check only between atomic operations: a single large file, metadata
+        // page or ioctl job can exceed the byte/time budgets on its own.
+        if self.batch.operations >= self.batch.limit
+            || self.batch.bytes >= 64 * 1024 * 1024
+            || self.batch.started.elapsed() >= Duration::from_secs(1)
+        {
+            self.flush_batch()?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_batch(&mut self) -> Result<()> {
+        if self.batch.active {
+            #[cfg(feature = "test-failpoints")]
+            self.test_hook(&format!("{}:before-commit", self.batch.phase))?;
+            self.conn.execute_batch("COMMIT")?;
+            self.batch.active = false;
+            self.batch.commits += 1;
+            #[cfg(feature = "test-failpoints")]
+            self.test_hook(&format!("{}:after-commit", self.batch.phase))?;
+        }
+        Ok(())
+    }
+
+    pub fn batch_commits(&self) -> u64 {
+        self.batch.commits
+    }
+
+    pub fn test_hook(&self, event: &str) -> Result<()> {
+        #[cfg(feature = "test-failpoints")]
+        crate::failpoints::hit(&self.conn, event)?;
+        #[cfg(not(feature = "test-failpoints"))]
+        let _ = event;
+        Ok(())
     }
 
     pub fn summarize(&self, stats: &mut Stats) -> Result<()> {
@@ -366,8 +465,14 @@ impl Index {
                 let target = self.next_pending(kind, cursor)?;
                 let Some(target) = target else { break };
                 cursor = target.id;
+                self.begin_batch("apply")?;
+                let bytes_before = stats.bytes_deduped + stats.bytes_already_shared;
                 self.apply_target(&target, backend, stats)?;
+                self.batch_step(
+                    (stats.bytes_deduped + stats.bytes_already_shared).saturating_sub(bytes_before),
+                )?;
             }
+            self.flush_batch()?;
         }
         Ok(())
     }
@@ -527,7 +632,8 @@ impl Index {
                 return Ok(());
             }
             if complete {
-                let tx = self.conn.transaction()?;
+                self.test_hook("apply:shared")?;
+                let tx = self.conn.savepoint()?;
                 tx.execute_cached(
                     "INSERT OR REPLACE INTO completed(target,source) VALUES (?1,?2)",
                     params![target.id, source.id],
@@ -550,11 +656,11 @@ impl Index {
         }
     }
 
-    fn invalidate(&self, file_id: i64) -> Result<()> {
+    fn invalidate(&mut self, file_id: i64) -> Result<()> {
         // A path can become stale after discovery's committed window (e.g. a
         // directory rename). Preserve its native identity before deleting the
         // path/hash record; no future inode event is required to rediscover it.
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute_cached("INSERT OR IGNORE INTO discovery SELECT crawl_id,ino,0 FROM btrfs_files WHERE file_id=?1",[file_id])?;
         tx.execute_cached("DELETE FROM files WHERE id=?1", [file_id])?;
         tx.commit()?;

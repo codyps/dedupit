@@ -22,6 +22,7 @@ fn setup(granularity: Granularity) -> (TempDir, Options) {
         granularity,
         verify: false,
         scanner: dedupit::Scanner::Portable,
+        commit_batch_size: 64,
     };
     (dir, options)
 }
@@ -77,6 +78,37 @@ fn unchanged_runs_read_nothing_and_only_changed_files_are_hashed() {
     assert_eq!(third.duplicate_files, 0);
     fs::remove_file(options.roots[0].join("a")).unwrap();
     assert_eq!(run(&options, false).unwrap().files_removed, 1);
+}
+
+#[test]
+fn batching_reduces_commits_without_changing_matches_or_completed_work() {
+    let (_dir, mut options) = setup(Granularity::Both);
+    for i in 0..130 {
+        put(&options, &format!("{i:03}"), &vec![42; 4096]);
+    }
+    let mut batched_backend = ComparingBackend::default();
+    let batched = run_with_backend(&options, true, &mut batched_backend).unwrap();
+    assert!(batched.errors.is_empty(), "{batched:?}");
+    assert_eq!(batched.jobs_completed, 129);
+    options.database.set_file_name("single.sqlite");
+    options.commit_batch_size = 1;
+    let mut single_backend = ComparingBackend::default();
+    let single = run_with_backend(&options, true, &mut single_backend).unwrap();
+    assert!(single.errors.is_empty(), "{single:?}");
+    assert_eq!(single.jobs_completed, batched.jobs_completed);
+    assert_eq!(single.duplicate_files, batched.duplicate_files);
+    assert_eq!(single.duplicate_chunks, batched.duplicate_chunks);
+    assert_eq!(single.bytes_hashed, batched.bytes_hashed);
+    assert_eq!(single_backend.calls, batched_backend.calls);
+    assert!(
+        batched.database_batches < single.database_batches / 4,
+        "batching did not reduce commits: {batched:?}, {single:?}"
+    );
+    // Commit policy is deliberately not part of the index's content config.
+    options.commit_batch_size = 7;
+    let resumed = run_with_backend(&options, true, &mut ComparingBackend::default()).unwrap();
+    assert_eq!(resumed.bytes_hashed, 0);
+    assert_eq!(resumed.jobs_attempted, 0);
 }
 
 #[test]

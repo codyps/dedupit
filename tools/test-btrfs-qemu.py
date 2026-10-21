@@ -102,6 +102,22 @@ def validate_guest(serial, returncode, expected_tests):
         raise RuntimeError("guest must pass every discovery test without skips or ignores")
 
 
+REQUIRED_BATCH_TESTS = {
+    "batch_crashes::portable_batches_recover_uncommitted_spilled_wal_and_keep_committed_files",
+    "batch_crashes::native_batches_keep_discovery_cursors_and_hash_acknowledgements_atomic",
+    "batch_crashes::apply_batches_replay_only_uncommitted_completions_and_preserve_cow_contents",
+}
+
+
+def validate_listing(listing):
+    names = {line.removesuffix(": test") for line in listing.splitlines()
+             if line.endswith(": test")}
+    missing = REQUIRED_BATCH_TESTS - names
+    if missing:
+        raise RuntimeError(f"required batch crash tests not compiled: {sorted(missing)}")
+    return len(names)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kernel", type=Path, required=True, help="x86_64 bzImage")
@@ -124,7 +140,7 @@ def main():
     for required in ["mount", "umount", "insmod", "poweroff", "sh", "grep", "sed"]:
         if required not in applets:
             raise RuntimeError(f"BusyBox lacks required applet: {required}")
-    build = subprocess.run([args.cargo, "test", "--locked", "--test", "btrfs_discovery",
+    build = subprocess.run([args.cargo, "test", "--locked", "--features", "test-failpoints", "--test", "btrfs_discovery",
                             "--no-run", "--message-format=json"],
                            check=True, stdout=subprocess.PIPE, text=True)
     artifacts = [json.loads(line) for line in build.stdout.splitlines()]
@@ -133,9 +149,7 @@ def main():
     if len(executables) != 1:
         raise RuntimeError(f"expected one test executable: {executables}")
     listing = subprocess.check_output([executables[0], "--list", "--format", "terse"], text=True)
-    expected_tests = sum(line.endswith(": test") for line in listing.splitlines())
-    if not expected_tests:
-        raise RuntimeError("discovery test binary contains no tests")
+    expected_tests = validate_listing(listing)
     args.log.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="dedupit-qemu-") as temporary:
         work = Path(temporary)

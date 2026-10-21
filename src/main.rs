@@ -26,6 +26,9 @@ struct Cli {
     /// Change discovery strategy. Btrfs tree searches require CAP_SYS_ADMIN.
     #[arg(long, value_enum, default_value = "auto")]
     scanner: Scanner,
+    /// Operations per durable commit; unfinished batches are replayed after a crash.
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=4096))]
+    commit_batch_size: u16,
     /// Emit machine-readable run statistics.
     #[arg(long)]
     json: bool,
@@ -45,6 +48,7 @@ fn main() -> Result<()> {
         granularity: cli.granularity,
         verify: cli.verify,
         scanner: cli.scanner,
+        commit_batch_size: cli.commit_batch_size as usize,
     };
     let stats = dedupit::run(&options, cli.apply)?;
     if cli.list {
