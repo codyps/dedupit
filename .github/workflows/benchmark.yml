@@ -48,30 +48,45 @@ jobs:
           # records the selected accelerator, including an explicit TCG fallback.
           if test -e /dev/kvm; then
             sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+            bench_accel=kvm
+          else
+            bench_accel=tcg
           fi
           if test "$BENCH_BASELINE" = true; then
             baseline_tree="$RUNNER_TEMP/dedupit-benchmark-baseline"
             git worktree add --detach "$baseline_tree" 7c36e6d2644acc97c0187075178f6e0b22461fb5
             (
               cd "$baseline_tree"
-              CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/baseline-build" \
+              CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
                 python3 tools/profile_btrfs_qemu.py \
                 --kernel "$RUNNER_TEMP/benchmark-kernel" \
                 --modules "/lib/modules/$kernel_version" \
                 --busybox /bin/busybox --time /usr/bin/time \
                 --files "$BENCH_FILES" --repetitions "$BENCH_REPETITIONS" \
                 --memory-mib 4096 --cpus 2 --timeout 9000 \
+                --accel "$bench_accel" \
                 --output "$GITHUB_WORKSPACE/target/btrfs-scale-qemu/baseline/results.json" \
                 --log "$GITHUB_WORKSPACE/target/btrfs-scale-qemu/baseline/serial.log"
             )
             git worktree remove "$baseline_tree"
+          fi
+          # Access can change after a VM exits. Regrant it before the next VM,
+          # and explicitly require the same accelerator for a paired comparison.
+          if test "$bench_accel" = kvm; then
+            sudo setfacl -m "u:$(id -un):rw" /dev/kvm
           fi
           python3 tools/profile_btrfs_qemu.py \
             --kernel "$RUNNER_TEMP/benchmark-kernel" \
             --modules "/lib/modules/$kernel_version" \
             --busybox /bin/busybox --time /usr/bin/time \
             --files "$BENCH_FILES" --repetitions "$BENCH_REPETITIONS" \
-            --memory-mib 4096 --cpus 2 --timeout 9000
+            --memory-mib 4096 --cpus 2 --timeout 9000 --accel "$bench_accel"
+          if test "$BENCH_BASELINE" = true; then
+            python3 tools/compare_btrfs_profiles.py \
+              target/btrfs-scale-qemu/baseline/results.json \
+              target/btrfs-scale-qemu/results.json \
+              --output target/btrfs-scale-qemu/comparison.json
+          fi
       - name: Upload measurements and complete guest log
         if: always()
         uses: actions/upload-artifact@v4
