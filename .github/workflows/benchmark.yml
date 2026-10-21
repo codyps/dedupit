@@ -69,6 +69,10 @@ jobs:
                 --log "$GITHUB_WORKSPACE/target/btrfs-scale-qemu/baseline/serial.log"
             )
             git worktree remove "$baseline_tree"
+            # Cargo can consider same-name worktree artifacts fresh when the
+            # other checkout's mtimes are older. Retain dependencies, but force
+            # the actual project and driver to rebuild from the current tree.
+            cargo clean --release --package dedupit
           fi
           # Access can change after a VM exits. Regrant it before the next VM,
           # and explicitly require the same accelerator for a paired comparison.

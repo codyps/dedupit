@@ -9,6 +9,8 @@ def compare(before, after):
     for report in [before, after]:
         if report.get('validated') is not True:
             raise RuntimeError('both benchmark runs must pass full verification')
+    if before['environment']['cli_sha256'] == after['environment']['cli_sha256']:
+        raise RuntimeError('baseline and current executable must be distinct builds')
     for key in ['accelerator', 'cpus', 'memory_mib', 'data_gib', 'state_gib',
                 'qemu_version', 'data_mount', 'index_mount', 'build']:
         if before['environment'][key] != after['environment'][key]:
