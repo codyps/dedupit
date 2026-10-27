@@ -18,3 +18,8 @@ kernel, and the native btrfs job needs loop devices, btrfs kernel support, and
 permission to mount and unmount its temporary filesystem. These jobs must run
 in the GARM VM rather than an unprivileged container. Nested KVM is optional;
 QEMU retains its software-emulation fallback.
+
+The all-features test job also mounts a temporary btrfs filesystem for `TMPDIR`.
+Its crash-recovery failpoints need successful deduplication; ext4 accepts the
+portable scan but cannot reach the sharing failpoint. All test assertions and
+feature coverage are retained.

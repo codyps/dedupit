@@ -9,7 +9,7 @@ jobs:
         timeout-minutes: 5
         run: |
           sudo apt-get -o Acquire::Retries=3 update
-          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends ca-certificates curl git python3 gh jq build-essential pkg-config libssl-dev
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends ca-certificates curl git python3 gh jq build-essential pkg-config libssl-dev btrfs-progs
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -17,7 +17,19 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --all-targets --all-features
+      - name: Test all features on btrfs
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The crash failpoints require real FIDEDUPERANGE support, which the
+          # VM's default ext4 temporary directory does not provide.
+          truncate -s 2G "$RUNNER_TEMP/dedupit-all-features.img"
+          mkfs.btrfs -f "$RUNNER_TEMP/dedupit-all-features.img"
+          mkdir "$RUNNER_TEMP/dedupit-all-features"
+          sudo mount -o loop,compress=zstd "$RUNNER_TEMP/dedupit-all-features.img" "$RUNNER_TEMP/dedupit-all-features"
+          trap 'sudo umount "$RUNNER_TEMP/dedupit-all-features"' EXIT
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/dedupit-all-features"
+          TMPDIR="$RUNNER_TEMP/dedupit-all-features" cargo test --locked --all-targets --all-features
       - name: Test QEMU result validation
         run: python3 -m unittest discover -s tools -p 'test_*.py'
 
