@@ -5,6 +5,8 @@ pub mod backend;
 #[cfg(target_os = "linux")]
 mod btrfs_io;
 #[cfg(target_os = "linux")]
+mod btrfs_mount;
+#[cfg(target_os = "linux")]
 mod btrfs_scan;
 #[cfg(feature = "test-failpoints")]
 mod failpoints;
@@ -72,6 +74,8 @@ pub struct Stats {
     pub duplicate_chunk_bytes: u64,
     pub jobs_attempted: u64,
     pub jobs_completed: u64,
+    /// Bounded sharing passes performed before scanning finished.
+    pub interleaved_batches: u64,
     /// Logical bytes accepted by the kernel, NOT measured physical savings.
     pub bytes_deduped: u64,
     pub bytes_already_shared: u64,
@@ -124,12 +128,11 @@ pub fn run_with_backend(
     );
     let mut index = index::Index::open(options)?;
     let mut stats = Stats::default();
-    scan::scan(&mut index, options, &mut stats).context("scanning files")?;
+    let mut sharing = index::Interleaver::new(if apply { Some(backend) } else { None });
+    scan::scan(&mut index, options, &mut stats, &mut sharing).context("scanning files")?;
     index.flush_batch()?;
     index.summarize(&mut stats)?;
-    if apply {
-        index.apply(backend, &mut stats)?;
-    }
+    sharing.finish(&mut index, &mut stats)?;
     index.flush_batch()?;
     stats.database_batches = index.batch_commits();
     Ok(stats)

@@ -15,10 +15,20 @@ pub(crate) struct Index {
     pub excluded: Vec<PathBuf>,
     pub buffer: Vec<u8>,
     batch: Batch,
+    pub scan_phase: ScanPhase,
     #[cfg(target_os = "linux")]
     pub mapping_sync: std::collections::HashMap<i64, File>,
+    #[cfg(target_os = "linux")]
+    pub crawl_prefixes: std::collections::HashMap<i64, PathBuf>,
     _lock: File,
     _database: File,
+}
+
+pub(crate) enum ScanPhase {
+    Complete,
+    Portable,
+    #[cfg(target_os = "linux")]
+    Native,
 }
 
 // Only flush_batch commits the outer transaction. Dropping Index on an error
@@ -33,6 +43,104 @@ struct Batch {
     limit: usize,
     commits: u64,
     poisoned: bool,
+}
+
+/// Sharing only starts between committed scan operations. Each pass seeks
+/// forward through newly pending ranges, rather than sweeping the index again.
+/// The final pass also picks up old IDs requeued by source invalidation.
+pub(crate) struct Interleaver<'a> {
+    backend: Option<&'a mut dyn Backend>,
+    cursors: [i64; 2],
+}
+
+impl<'a> Interleaver<'a> {
+    pub fn new(backend: Option<&'a mut dyn Backend>) -> Self {
+        Self {
+            backend,
+            cursors: [0; 2],
+        }
+    }
+
+    pub fn between_batches(&mut self, index: &mut Index, stats: &mut Stats) -> Result<()> {
+        let Some(backend) = self.backend.as_deref_mut() else {
+            return Ok(());
+        };
+        if index.batch.active {
+            return Ok(());
+        }
+        // All rows up to this bound belong to complete, committed file hashes.
+        // New work gets a later AUTOINCREMENT ID; failed attempts stay retryable
+        // next invocation but do not get retried at every sharing boundary.
+        let high: i64 =
+            index
+                .conn
+                .query_row_cached("SELECT COALESCE(MAX(id),0) FROM ranges", [], |r| r.get(0))?;
+        let mut visited = 0;
+        for kind in [1, 0] {
+            let started = Instant::now();
+            let bytes_before = stats.bytes_deduped + stats.bytes_already_shared;
+            for _ in 0..1024 {
+                // Chunks of newly indexed files wait until their whole-file
+                // job has been considered. A whole-file success consumes them.
+                let ceiling = if kind == 1 {
+                    high
+                } else {
+                    high.min(self.cursors[1])
+                };
+                let target = index
+                    .conn
+                    .query_row_cached(
+                        &format!(
+                            "{JOB_SELECT} WHERE r.pending=1 AND r.kind=?1 AND r.id>?2 AND r.id<=?3
+                     AND NOT EXISTS(SELECT 1 FROM apply_failed a WHERE a.id=r.id)
+                     AND ({ready})
+                     AND (?1=1 OR NOT EXISTS(SELECT 1 FROM ranges w WHERE w.file_id=r.file_id
+                         AND w.kind=1 AND w.pending=1
+                         AND NOT EXISTS(SELECT 1 FROM apply_failed a WHERE a.id=w.id)))
+                     ORDER BY r.id LIMIT 1",
+                            ready = index.ready()
+                        ),
+                        params![kind, self.cursors[kind as usize], ceiling],
+                        Job::from_row,
+                    )
+                    .optional()?;
+                let Some(target) = target else {
+                    self.cursors[kind as usize] = self.cursors[kind as usize].max(ceiling);
+                    break;
+                };
+                self.cursors[kind as usize] = target.id;
+                index.begin_batch("apply")?;
+                let before = stats.bytes_deduped + stats.bytes_already_shared;
+                index.attempt_target(&target, backend, stats)?;
+                index.batch_step(
+                    (stats.bytes_deduped + stats.bytes_already_shared).saturating_sub(before),
+                )?;
+                visited += 1;
+                if stats.bytes_deduped + stats.bytes_already_shared - bytes_before
+                    >= 64 * 1024 * 1024
+                    || started.elapsed() >= Duration::from_secs(1)
+                {
+                    break;
+                }
+            }
+            index.flush_batch()?;
+        }
+        if visited > 0 {
+            stats.interleaved_batches += 1;
+            index.test_hook("interleave:shared")?;
+        }
+        // Extent maps remain provisional. The final apply pass performs the
+        // filesystem commit/confirmation barrier once, not once per scan batch.
+        Ok(())
+    }
+
+    pub fn finish(&mut self, index: &mut Index, stats: &mut Stats) -> Result<()> {
+        index.scan_phase = ScanPhase::Complete;
+        if let Some(backend) = self.backend.as_deref_mut() {
+            index.apply(backend, stats)?;
+        }
+        Ok(())
+    }
 }
 
 /// Repeated scan/job statements share a bounded connection-local cache, also
@@ -176,7 +284,9 @@ impl Index {
              CREATE TRIGGER IF NOT EXISTS invalidate_summary_update AFTER UPDATE OF hash,length,kind ON ranges BEGIN
                DELETE FROM config WHERE key='summary';
              END;
-             CREATE TEMP TABLE seen (file_id INTEGER PRIMARY KEY);",
+             CREATE TEMP TABLE seen (file_id INTEGER PRIMARY KEY);
+             CREATE TEMP TABLE apply_failed (id INTEGER PRIMARY KEY);
+             CREATE TEMP TABLE apply_crawls (id INTEGER PRIMARY KEY);",
         )?;
         if version < 2 {
             conn.execute_batch(
@@ -300,8 +410,11 @@ impl Index {
             roots: reduced,
             excluded,
             buffer: Vec::new(),
+            scan_phase: ScanPhase::Complete,
             #[cfg(target_os = "linux")]
             mapping_sync: std::collections::HashMap::new(),
+            #[cfg(target_os = "linux")]
+            crawl_prefixes: std::collections::HashMap::new(),
             batch: Batch {
                 active: false,
                 phase: "",
@@ -494,7 +607,7 @@ impl Index {
         Ok(())
     }
 
-    pub fn apply(&mut self, backend: &mut impl Backend, stats: &mut Stats) -> Result<()> {
+    pub fn apply(&mut self, backend: &mut dyn Backend, stats: &mut Stats) -> Result<()> {
         // Clear unique ranges in one durable operation, rather than committing
         // once per unique chunk. Only changed/new ranges are pending on reruns.
         self.conn.execute_cached(
@@ -514,7 +627,7 @@ impl Index {
                 cursor = target.id;
                 self.begin_batch("apply")?;
                 let bytes_before = stats.bytes_deduped + stats.bytes_already_shared;
-                self.apply_target(&target, backend, stats)?;
+                self.attempt_target(&target, backend, stats)?;
                 self.batch_step(
                     (stats.bytes_deduped + stats.bytes_already_shared).saturating_sub(bytes_before),
                 )?;
@@ -527,16 +640,56 @@ impl Index {
     }
 
     fn next_pending(&self, kind: i64, cursor: i64) -> Result<Option<Job>> {
-        Ok(self.conn.query_row_cached(
-            &format!("{JOB_SELECT} WHERE r.pending=1 AND r.kind=?1 AND r.id>?2 ORDER BY r.id LIMIT 1"),
-            params![kind, cursor], Job::from_row,
-        ).optional()?)
+        Ok(self
+            .conn
+            .query_row_cached(
+                &format!(
+                    "{JOB_SELECT} WHERE r.pending=1 AND r.kind=?1 AND r.id>?2
+                AND NOT EXISTS(SELECT 1 FROM apply_failed a WHERE a.id=r.id) ORDER BY r.id LIMIT 1"
+                ),
+                params![kind, cursor],
+                Job::from_row,
+            )
+            .optional()?)
+    }
+
+    fn attempt_target(
+        &mut self,
+        target: &Job,
+        backend: &mut dyn Backend,
+        stats: &mut Stats,
+    ) -> Result<()> {
+        let attempted = stats.jobs_attempted;
+        let stale = stats.stale;
+        self.apply_target(target, backend, stats)?;
+        if stats.jobs_attempted != attempted || stats.stale != stale {
+            self.conn.execute_cached(
+                "INSERT OR IGNORE INTO apply_failed SELECT id FROM ranges WHERE id=?1 AND pending=1", [target.id],
+            )?;
+        }
+        Ok(())
+    }
+
+    // During scanning, cached paths/hashes must first be reconciled. Native
+    // clean inodes need no reopening, but changed inodes and renamed descendants
+    // remain in discovery until validated. Other subvolumes wait for their turn.
+    fn ready(&self) -> &'static str {
+        match self.scan_phase {
+            ScanPhase::Complete => "1",
+            ScanPhase::Portable => "EXISTS(SELECT 1 FROM seen WHERE file_id=f.id)",
+            #[cfg(target_os = "linux")]
+            ScanPhase::Native => {
+                "EXISTS(SELECT 1 FROM btrfs_files b JOIN apply_crawls c ON c.id=b.crawl_id
+                WHERE b.file_id=f.id AND NOT EXISTS(SELECT 1 FROM discovery d
+                    WHERE d.crawl_id=b.crawl_id AND d.ino=b.ino))"
+            }
+        }
     }
 
     fn apply_target(
         &mut self,
         target: &Job,
-        backend: &mut impl Backend,
+        backend: &mut dyn Backend,
         stats: &mut Stats,
     ) -> Result<()> {
         let mut cursor = 0;
@@ -570,6 +723,20 @@ impl Index {
                 }
                 return Ok(());
             };
+            if !matches!(self.scan_phase, ScanPhase::Complete)
+                && !self.conn.query_row_cached(
+                    &format!(
+                        "SELECT ({ready}) FROM files f WHERE f.id=?1",
+                        ready = self.ready()
+                    ),
+                    [source.file_id],
+                    |r| r.get::<_, bool>(0),
+                )?
+            {
+                // Keep this match pending until its representative is validated.
+                // Do not walk every member of a large unready duplicate group.
+                return Ok(());
+            }
             found = true;
             cursor = source.id;
             if source.file_id == target.file_id
@@ -719,6 +886,7 @@ impl Index {
                     )?;
                 }
                 stats.jobs_completed += 1;
+                self.test_hook("apply:completion-staged")?;
                 return Ok(());
             }
             // A failure is not a completed job. Keep it pending for the next run.

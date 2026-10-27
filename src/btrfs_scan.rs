@@ -3,7 +3,7 @@
 //! stable hashing or a confirmed deletion/out-of-scope observation.
 use crate::{
     btrfs_io::{self as io, Inode, Item, Key},
-    index::{decode_path, path_bytes, Index, SqlCache},
+    index::{decode_path, path_bytes, Index, Interleaver, ScanPhase, SqlCache},
     scan::{self, Extent, NativeView},
     Options, Scanner, Stats,
 };
@@ -21,6 +21,9 @@ struct Crawl {
     id: i64,
     path: PathBuf,
     file: File,
+    // Metadata paths are relative to the real subvolume root. A bind mount
+    // exposes only this prefix at `path`; never access its hidden siblings.
+    prefix: PathBuf,
 }
 
 /// Injectable metadata source keeps the crash/ordering state machine testable
@@ -125,7 +128,12 @@ pub(crate) fn confirm_apply_mappings(index: &mut Index, stats: &mut Stats) -> Re
                 })?;
         discover_inner(
             index,
-            &Crawl { id, file, path },
+            &Crawl {
+                id,
+                file,
+                path,
+                prefix: index.crawl_prefixes.get(&id).cloned().unwrap_or_default(),
+            },
             &mut Native,
             stats,
             Some(high),
@@ -162,7 +170,12 @@ impl Source for Native {
     }
 }
 
-pub(crate) fn scan(index: &mut Index, options: &Options, stats: &mut Stats) -> Result<bool> {
+pub(crate) fn scan(
+    index: &mut Index,
+    options: &Options,
+    stats: &mut Stats,
+    sharing: &mut Interleaver<'_>,
+) -> Result<bool> {
     let prepared = prepare(index);
     let contexts=match prepared {
         Ok(contexts)=>contexts,
@@ -174,7 +187,7 @@ pub(crate) fn scan(index: &mut Index, options: &Options, stats: &mut Stats) -> R
     };
     let mut ids = HashSet::new();
     let mut crawls = Vec::new();
-    for (path, file, identity) in contexts {
+    for (path, file, identity, prefix) in contexts {
         index.conn.execute_cached(
             "INSERT OR IGNORE INTO crawls(identity,path) VALUES (?1,?2)",
             params![identity, path_bytes(&path)],
@@ -185,7 +198,13 @@ pub(crate) fn scan(index: &mut Index, options: &Options, stats: &mut Stats) -> R
             |r| r.get(0),
         )?;
         ids.insert(id);
-        crawls.push(Crawl { id, path, file });
+        index.crawl_prefixes.insert(id, prefix.clone());
+        crawls.push(Crawl {
+            id,
+            path,
+            file,
+            prefix,
+        });
     }
     // Missing subvolumes or changed UUIDs invalidate their old observations.
     let stale: Vec<i64> = index
@@ -203,10 +222,11 @@ pub(crate) fn scan(index: &mut Index, options: &Options, stats: &mut Stats) -> R
         tx.commit()?;
     }
     let mut source = Native;
+    index.scan_phase = ScanPhase::Native;
     for crawl in crawls {
         stats.btrfs_subvolumes += 1;
         discover(index, &crawl, &mut source, stats)?;
-        process(index, &crawl, options, &mut source, stats)?;
+        process(index, &crawl, options, &mut source, stats, sharing)?;
     }
     // Old portable observations which never mapped to an accessible inode are
     // removed only after successful native enumeration of every context.
@@ -219,9 +239,10 @@ pub(crate) fn scan(index: &mut Index, options: &Options, stats: &mut Stats) -> R
     Ok(true)
 }
 
-type Prepared = Vec<(PathBuf, File, Vec<u8>)>;
+type Prepared = Vec<(PathBuf, File, Vec<u8>, PathBuf)>;
 fn prepare(index: &Index) -> Result<Prepared> {
-    reject_nested_mounts(&index.roots)?;
+    let mounts = crate::btrfs_mount::mounts()?;
+    reject_nested_mounts(&index.roots, &mounts)?;
     let mut bases = BTreeSet::new();
     for root in &index.roots {
         let mut base = if root.is_dir() {
@@ -235,6 +256,9 @@ fn prepare(index: &Index) -> Result<Prepared> {
             "{root:?} is not on btrfs"
         );
         while fs::symlink_metadata(&base)?.ino() != 256 {
+            if mounts.iter().any(|mount| mount.point == base) {
+                break;
+            }
             let parent = base.parent().context("subvolume root is not reachable")?;
             ensure!(
                 fs::symlink_metadata(parent)?.dev() == fs::symlink_metadata(&base)?.dev(),
@@ -250,7 +274,25 @@ fn prepare(index: &Index) -> Result<Prepared> {
         if !visited.insert(path.clone()) {
             continue;
         }
-        let file = open_directory(&path)?;
+        let anchor = open_directory(&path)?;
+        let (file, prefix) = if anchor.metadata()?.ino() == 256 {
+            (anchor, PathBuf::new())
+        } else {
+            let file = crate::btrfs_mount::open_root(&anchor, &mounts)?;
+            let prefix = io::lookup(&file, io::tree_id(&file)?, anchor.metadata()?.ino())?;
+            ensure!(
+                !prefix.as_os_str().is_empty(),
+                "hidden root has an empty path prefix"
+            );
+            let current = open_directory(&path)?;
+            ensure!(
+                current.metadata()?.ino() == anchor.metadata()?.ino()
+                    && current.metadata()?.dev() == anchor.metadata()?.dev()
+                    && io::tree_id(&current)? == io::tree_id(&file)?,
+                "bind mount changed while preparing discovery"
+            );
+            (file, prefix)
+        };
         ensure!(
             file.metadata()?.ino() == 256,
             "subvolume root changed while preparing discovery"
@@ -262,14 +304,21 @@ fn prepare(index: &Index) -> Result<Prepared> {
         io::search(&file, 0, Key::FIRST, Key::FIRST, 0)?;
         io::probe_paths(&file)?;
         for child in io::children(&file)? {
-            let child = path.join(child);
+            let Ok(relative) = child.strip_prefix(&prefix) else {
+                continue;
+            };
+            let child = path.join(relative);
             if relevant(&child, &index.roots) {
                 bases.insert(child);
             }
         }
         let mut identity = io::identity(&file)?;
         identity.extend_from_slice(path_bytes(&path));
-        result.push((path, file, identity));
+        if !prefix.as_os_str().is_empty() {
+            identity.push(0); // paths cannot contain NUL; preserve old identities.
+            identity.extend_from_slice(path_bytes(&prefix));
+        }
+        result.push((path, file, identity, prefix));
     }
     Ok(result)
 }
@@ -281,39 +330,15 @@ fn open_directory(path: &Path) -> Result<File> {
         .open(path)?)
 }
 
-fn reject_nested_mounts(roots: &[PathBuf]) -> Result<()> {
+fn reject_nested_mounts(roots: &[PathBuf], mounts: &[crate::btrfs_mount::Mount]) -> Result<()> {
     // A metadata tree cannot enumerate files supplied by an overlaid mount.
     // Conservatively use the portable walk for such scopes.
-    let mountinfo = fs::read("/proc/self/mountinfo")?;
-    for line in mountinfo.split(|b| *b == b'\n') {
-        let Some(raw) = line.split(|b| *b == b' ').nth(4) else {
-            continue;
-        };
-        let mut decoded = Vec::new();
-        let mut at = 0;
-        while at < raw.len() {
-            if raw[at] == b'\\'
-                && at + 3 < raw.len()
-                && raw[at + 1..at + 4]
-                    .iter()
-                    .all(|b| (b'0'..=b'7').contains(b))
-            {
-                let value = (raw[at + 1] - b'0') as u16 * 64
-                    + (raw[at + 2] - b'0') as u16 * 8
-                    + (raw[at + 3] - b'0') as u16;
-                ensure!(value <= 255, "invalid mountinfo escape");
-                decoded.push(value as u8);
-                at += 4;
-            } else {
-                decoded.push(raw[at]);
-                at += 1;
-            }
-        }
-        let mount = decode_path(decoded);
+    for mount in mounts {
+        let mount = &mount.point;
         ensure!(
             !roots
                 .iter()
-                .any(|root| mount != *root && mount.starts_with(root)),
+                .any(|root| mount != root && mount.starts_with(root)),
             "nested mount {mount:?} requires portable discovery"
         );
     }
@@ -471,6 +496,7 @@ fn process(
     options: &Options,
     source: &mut impl Source,
     stats: &mut Stats,
+    sharing: &mut Interleaver<'_>,
 ) -> Result<()> {
     // Directory jobs discover deletions, scope changes and renamed descendants.
     // Process each failing job at most once per invocation.
@@ -533,6 +559,9 @@ fn process(
                 )?;
             }
             index.batch_step(stats.bytes_hashed.saturating_sub(bytes_before))?;
+            if !directory {
+                sharing.between_batches(index, stats)?;
+            }
         }
         if directory {
             // Failed bootstrap directory jobs remain queued. Subsequent cycles
@@ -543,6 +572,12 @@ fn process(
             )?;
         }
         index.flush_batch()?;
+        if directory {
+            index
+                .conn
+                .execute_cached("INSERT OR IGNORE INTO apply_crawls VALUES (?1)", [crawl.id])?;
+            sharing.between_batches(index, stats)?;
+        }
     }
     Ok(())
 }
@@ -589,7 +624,12 @@ fn resolved(crawl: &Crawl, ino: u64, source: &mut impl Source) -> Result<Vec<Pat
     Ok(source
         .paths(&crawl.file, ino)?
         .into_iter()
-        .map(|relative| crawl.path.join(relative))
+        .filter_map(|relative| {
+            relative
+                .strip_prefix(&crawl.prefix)
+                .ok()
+                .map(|suffix| crawl.path.join(suffix))
+        })
         .collect())
 }
 
@@ -1031,6 +1071,7 @@ mod tests {
             id,
             path: source.base.clone(),
             file: File::open(&source.base).unwrap(),
+            prefix: PathBuf::new(),
         };
         (index, crawl)
     }
@@ -1038,7 +1079,14 @@ mod tests {
         let (mut index, crawl) = open(options, source);
         let mut stats = Stats::default();
         discover(&mut index, &crawl, source, &mut stats)?;
-        process(&mut index, &crawl, options, source, &mut stats)?;
+        process(
+            &mut index,
+            &crawl,
+            options,
+            source,
+            &mut stats,
+            &mut Interleaver::new(None),
+        )?;
         Ok(stats)
     }
     fn whole(options: &Options) -> Vec<u8> {
@@ -1094,7 +1142,15 @@ mod tests {
             let mut stats = Stats::default();
             let boundary = confirm.then_some(source.high);
             discover_inner(&mut index, &crawl, &mut source, &mut stats, boundary).unwrap();
-            process(&mut index, &crawl, &options, &mut source, &mut stats).unwrap();
+            process(
+                &mut index,
+                &crawl,
+                &options,
+                &mut source,
+                &mut stats,
+                &mut Interleaver::new(None),
+            )
+            .unwrap();
             assert_eq!(
                 stats.files_seen,
                 u64::from(!confirm || changed || queued),

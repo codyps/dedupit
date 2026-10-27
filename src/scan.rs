@@ -1,6 +1,6 @@
 use crate::{
     backend,
-    index::{path_bytes, Index, SqlCache},
+    index::{path_bytes, Index, Interleaver, ScanPhase, SqlCache},
     Granularity, Options, Stats,
 };
 use anyhow::{ensure, Context, Result};
@@ -201,11 +201,16 @@ fn open_regular_components(path: &Path, write: bool) -> io::Result<File> {
     Ok(parent)
 }
 
-pub(crate) fn scan(index: &mut Index, options: &Options, stats: &mut Stats) -> Result<()> {
+pub(crate) fn scan(
+    index: &mut Index,
+    options: &Options,
+    stats: &mut Stats,
+    sharing: &mut Interleaver<'_>,
+) -> Result<()> {
     #[cfg(target_os = "linux")]
     if options.scanner != crate::Scanner::Portable
         && !options.verify
-        && crate::btrfs_scan::scan(index, options, stats)?
+        && crate::btrfs_scan::scan(index, options, stats, sharing)?
     {
         return Ok(());
     }
@@ -218,10 +223,16 @@ pub(crate) fn scan(index: &mut Index, options: &Options, stats: &mut Stats) -> R
     index
         .conn
         .execute_batch("DELETE FROM crawls; DELETE FROM extent_state; DELETE FROM file_extents; DELETE FROM apply_mappings;")?;
-    portable(index, options, stats)
+    portable(index, options, stats, sharing)
 }
 
-fn portable(index: &mut Index, options: &Options, stats: &mut Stats) -> Result<()> {
+fn portable(
+    index: &mut Index,
+    options: &Options,
+    stats: &mut Stats,
+    sharing: &mut Interleaver<'_>,
+) -> Result<()> {
+    index.scan_phase = ScanPhase::Portable;
     let mut traversal_complete = true;
     let excluded_ids: Vec<_> = index
         .excluded
@@ -229,6 +240,7 @@ fn portable(index: &mut Index, options: &Options, stats: &mut Stats) -> Result<(
         .filter_map(|path| fs::symlink_metadata(path).ok())
         .map(|meta| (meta.dev(), meta.ino()))
         .collect();
+    sharing.between_batches(index, stats)?;
     for root in index.roots.clone() {
         for entry in WalkDir::new(&root).follow_links(false).max_open(32) {
             let entry = match entry {
@@ -255,6 +267,7 @@ fn portable(index: &mut Index, options: &Options, stats: &mut Stats) -> Result<(
                     .push(format!("scan {:?}: {error:#}", entry.path()));
             }
             index.batch_step(stats.bytes_hashed.saturating_sub(bytes_before))?;
+            sharing.between_batches(index, stats)?;
         }
     }
     index.flush_batch()?;

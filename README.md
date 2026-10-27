@@ -24,7 +24,7 @@ cargo build --release --locked
 # Discover and list duplicates without changing file storage.
 ./target/release/dedupit --database /var/cache/dedupit.sqlite --list /data
 
-# Deduplicate whole files first, then remaining matching partial ranges.
+# Share matches during scanning, with whole-file jobs before partial ranges.
 ./target/release/dedupit --database /var/cache/dedupit.sqlite --apply /data
 
 # Repeat the same command to process additions and changes incrementally.
@@ -59,6 +59,21 @@ Default chunk size is 128 KiB. Supported sizes are powers of two from 4 KiB to
 16 MiB. Smaller chunks find finer partial matches at the cost of more index
 space, hashing, and ioctl calls. There is no background service: schedule the
 same command periodically for continuous incremental operation.
+
+With `--apply`, sharing runs between committed scan batches, so duplicates can
+start sharing storage before the full scan finishes. Each sharing pass considers
+whole-file jobs before chunk jobs, with separate budgets of 1024 ranges, 64 MiB
+of accepted/already-shared bytes, or one second per kind. Budgets are checked
+between complete jobs; a single large job can exceed them. Forward-only cursors
+avoid repeatedly sweeping old ranges. Cached sources and targets await namespace
+and content reconciliation before use; deferred matches and requeued older jobs
+are handled by a final pass. Failed jobs remain retryable on the next invocation.
+JSON statistics include `interleaved_batches`. Report-only runs do not share data.
+
+Hashing, sharing completion records and native discovery retain the same durable
+batch boundaries during interleaving. Native extent maps stay provisional until
+the final filesystem commit/confirmation barrier. This changes when sharing
+starts; it does not evict index entries or impose a total index-size limit.
 
 Database commits default to **1024 operations per batch**. Batches also flush
 after 64 MiB of processed data or one second, checked between atomic operations;
@@ -120,6 +135,19 @@ scopes are accessible through its metadata ioctls. It reports a reason and falls
 back to the portable scanner if the required privileges, filesystem support,
 or accessible subvolume roots are missing. `--scanner btrfs` requires the native
 scanner and fails explicitly instead of silently falling back.
+
+When a bind mount hides the containing subvolume root, native discovery can
+mount that root privately through Linux's detached mount API (Linux 5.2+).
+This requires mount privileges, access to the mounted block device, `/proc`,
+and `/sys/fs/btrfs`. The device is pinned by descriptor and checked against
+the filesystem's kernel device inventory; the mounted filesystem and subvolume
+identities are checked again before use. The metadata mount is read-only,
+nodev, nosuid, noexec and close-on-exec. It has no mount point, does not change
+the caller's mount namespace, and is released when its last descriptor closes,
+including on errors or process exit. Discovery maps paths back through the
+original bind mount: hidden siblings are never indexed, listed or shared.
+Unavailable mount support follows the same auto-fallback/required-scanner error
+rules above. `--scanner portable` never creates these metadata mounts.
 
 The btrfs scanner follows the generation-filtered crawl model used by
 [bees](https://github.com/Zygo/bees/blob/master/docs/how-it-works.md):
@@ -253,8 +281,9 @@ In particular, discovery works on other Unix platforms, but the current native
 backend is Linux-only. The `Backend` trait allows adding other atomic native
 implementations.
 
-Native discovery requires an accessible subvolume root and Linux metadata ioctl
-capabilities. Overlaid/nested mounts inside a requested scope conservatively
+Native discovery requires Linux metadata ioctl capabilities and an accessible
+subvolume root, or the privileges/support for a detached metadata mount described
+above. Overlaid/nested mounts inside a requested scope conservatively
 require the portable scanner; ordinary nested btrfs subvolumes are supported.
 The kernel's inode-path ioctl has a 4 KiB result limit. An overflowing hardlink
 set is retained as a failed, retryable job with an explicit error; use

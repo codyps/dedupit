@@ -494,13 +494,14 @@ fn interrupt(database: &Path, root: &Path, _log: &Path, apply: bool) -> bool {
         batch_size: 2,
         hit: 3,
         event: if apply {
-            "apply:staged"
+            "apply:completion-staged"
         } else {
             "native-file:staged"
         },
     });
     assert_eq!(observation.staged["autocommit"], false);
     if apply {
+        assert!(observation.durable["completed"].as_u64().unwrap() > 0);
         assert!(
             observation.staged["completed"].as_u64().unwrap()
                 > observation.durable["completed"].as_u64().unwrap()

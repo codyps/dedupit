@@ -81,6 +81,60 @@ fn unchanged_runs_read_nothing_and_only_changed_files_are_hashed() {
 }
 
 #[test]
+fn apply_shares_committed_files_before_the_portable_scan_finishes() {
+    struct Observing {
+        database: std::path::PathBuf,
+        inner: ComparingBackend,
+        first_seen: Option<u64>,
+    }
+    impl Backend for Observing {
+        fn dedupe(
+            &mut self,
+            source: &File,
+            dest: &File,
+            range: Range,
+            offset: u64,
+        ) -> io::Result<Outcome> {
+            if self.first_seen.is_none() {
+                let reader = rusqlite::Connection::open(&self.database).unwrap();
+                self.first_seen = Some(
+                    reader
+                        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                        .unwrap(),
+                );
+            }
+            self.inner.dedupe(source, dest, range, offset)
+        }
+    }
+    let (_dir, options) = setup(Granularity::Both);
+    let bytes: Vec<_> = [vec![1; 4096], vec![2; 4096]].concat();
+    for i in 0..130 {
+        put(&options, &format!("{i:03}"), &bytes);
+    }
+    let mut backend = Observing {
+        database: options.database.clone(),
+        inner: ComparingBackend::default(),
+        first_seen: None,
+    };
+    let stats = run_with_backend(&options, true, &mut backend).unwrap();
+    assert!(stats.errors.is_empty(), "{stats:?}");
+    assert!(
+        matches!(backend.first_seen, Some(2..=129)),
+        "sharing waited for the complete scan: {:?}",
+        backend.first_seen
+    );
+    assert!(stats.interleaved_batches > 0);
+    assert_eq!(stats.jobs_completed, 129);
+    assert_eq!(
+        backend.inner.calls, 129,
+        "whole-file sharing should consume redundant chunk work"
+    );
+    let idle = run_with_backend(&options, true, &mut ComparingBackend::default()).unwrap();
+    assert_eq!(idle.bytes_hashed, 0);
+    assert_eq!(idle.jobs_attempted, 0);
+}
+
+#[test]
 fn batching_reduces_commits_without_changing_matches_or_completed_work() {
     let (_dir, mut options) = setup(Granularity::Both);
     for i in 0..130 {
@@ -161,7 +215,8 @@ fn deleted_representative_requeues_surviving_duplicates() {
 
 #[test]
 fn whole_files_take_precedence_and_partial_duplicates_still_share() {
-    let (_dir, options) = setup(Granularity::Both);
+    let (_dir, mut options) = setup(Granularity::Both);
+    options.commit_batch_size = 1;
     let mut data = vec![1; 4096];
     data.extend(vec![2; 4096]);
     put(&options, "a", &data);
@@ -558,13 +613,14 @@ fn unsupported_groups_do_not_attempt_every_pair() {
         }
     }
     let (_dir, options) = setup(Granularity::File);
-    for i in 0..50 {
+    for i in 0..130 {
         put(&options, &format!("{i}"), &vec![1; 4096]);
     }
     let mut backend = Unsupported(0);
     let result = run_with_backend(&options, true, &mut backend).unwrap();
     assert_eq!(result.jobs_completed, 0);
-    assert_eq!(backend.0, 49);
+    assert!(result.interleaved_batches > 1);
+    assert_eq!(backend.0, 129);
 }
 
 #[test]

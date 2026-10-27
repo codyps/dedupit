@@ -68,6 +68,182 @@ fn data(size: usize) -> Vec<u8> {
 }
 
 #[test]
+fn native_discovery_hidden_bind_mount_preserves_scope_and_incrementality() {
+    hidden_bind_roundtrip(false);
+    hidden_bind_roundtrip(true);
+}
+
+fn hidden_bind_roundtrip(cross_device: bool) {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::AsRawFd,
+            unix::{ffi::OsStrExt, fs::MetadataExt, process::CommandExt},
+        },
+        process::Command,
+    };
+    let (dir, options) = setup();
+    if first(&options).is_none() {
+        return;
+    }
+    let bytes = data(128 * 1024);
+    fs::write(options.roots[0].join("a"), &bytes).unwrap();
+    fs::write(options.roots[0].join("b"), &bytes).unwrap();
+    fs::write(dir.path().join("outside"), &bytes).unwrap();
+    fs::hard_link(options.roots[0].join("a"), dir.path().join("outside-link")).unwrap();
+    let external = tempfile::tempdir_in("/tmp").unwrap();
+    let visible = if cross_device {
+        external.path()
+    } else {
+        dir.path()
+    }
+    .join("bound with space");
+    fs::create_dir(&visible).unwrap();
+    let database = dir.path().join("bound.sqlite");
+    let run = |list: bool, source_path: &Path| {
+        let source = CString::new(source_path.as_os_str().as_bytes()).unwrap();
+        let target = CString::new(visible.as_os_str().as_bytes()).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dedupit"));
+        command
+            .args([
+                "--scanner",
+                "btrfs",
+                "--chunk-size",
+                "4096",
+                "--apply",
+                "--json",
+                "--database",
+            ])
+            .arg(&database);
+        if list {
+            command.arg("--list");
+        }
+        command.arg(&visible);
+        // SAFETY: only async-signal-safe syscalls run between fork and exec.
+        // Mounts are private before the bind, including when the host uses
+        // shared propagation; the test never changes the parent's namespace.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::unshare(libc::CLONE_NEWNS) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::mount(
+                    source.as_ptr(),
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if list {
+            let lines: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            for record in lines.iter().filter(|r| r["type"] == "duplicate") {
+                for key in ["source", "destination"] {
+                    assert!(Path::new(record[key].as_str().unwrap()).starts_with(&visible));
+                }
+            }
+            lines.last().unwrap()["stats"].clone()
+        } else {
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+        }
+    };
+    // Same-filesystem binds are intentional: comparing only st_dev while
+    // ascending would silently choose the wrong namespace-relative paths.
+    if !cross_device {
+        assert_eq!(
+            File::open(&visible).unwrap().metadata().unwrap().dev(),
+            File::open(&options.roots[0])
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .dev()
+        );
+    }
+    let initial = run(false, &options.roots[0]);
+    assert_eq!(initial["files_hashed"], 2);
+    assert_eq!(initial["duplicate_files"], 1);
+    assert_eq!(initial["errors"], serde_json::json!([]));
+    assert!(initial["bytes_deduped"].as_u64().unwrap() > 0);
+    let idle = run(true, &options.roots[0]);
+    assert_eq!(idle["files_seen"], 0, "{idle}");
+    assert_eq!(idle["bytes_hashed"], 0);
+    assert_eq!(idle["jobs_attempted"], 0);
+    assert_eq!(
+        fs::read_dir(&visible).unwrap().count(),
+        0,
+        "bind mount leaked into parent"
+    );
+    let a = OpenOptions::new()
+        .write(true)
+        .open(options.roots[0].join("a"))
+        .unwrap();
+    a.write_all_at(&[123], 0).unwrap();
+    a.sync_all().unwrap();
+    assert_eq!(fs::read(options.roots[0].join("b")).unwrap(), bytes);
+    let changed = run(false, &options.roots[0]);
+    assert_eq!(changed["files_hashed"], 1, "{changed}");
+    assert_eq!(changed["duplicate_files"], 0);
+    assert!(changed["bytes_hashed"].as_u64().unwrap() < bytes.len() as u64);
+    // Nested subvolumes remain visible below the bind prefix, including old
+    // data discovered independently of the parent's generation watermark.
+    #[repr(C)]
+    struct Args {
+        fd: i64,
+        name: [u8; 4088],
+    }
+    nix::ioctl_write_ptr!(create_subvolume, 0x94, 14, Args);
+    let parent = File::open(&options.roots[0]).unwrap();
+    let mut args = Args {
+        fd: 0,
+        name: [0; 4088],
+    };
+    args.name[..6].copy_from_slice(b"nested");
+    // SAFETY: live parent fd and correctly sized, NUL-terminated input.
+    unsafe { create_subvolume(parent.as_raw_fd(), &args) }.unwrap();
+    fs::write(options.roots[0].join("nested/c"), &bytes).unwrap();
+    let nested = run(false, &options.roots[0]);
+    assert!(
+        nested["btrfs_subvolumes"].as_u64().unwrap() >= 2,
+        "{nested}"
+    );
+    assert_eq!(nested["duplicate_files"], 1, "{nested}");
+    assert_eq!(run(true, &options.roots[0])["bytes_hashed"], 0);
+    // Rebinding to another prefix in the same subvolume invalidates the old
+    // crawl, even though filesystem/subvolume identities and visible root match.
+    let replacement = dir.path().join("replacement");
+    fs::create_dir(&replacement).unwrap();
+    fs::write(replacement.join("only"), &bytes).unwrap();
+    let rebound = run(true, &replacement);
+    assert_eq!(rebound["files_hashed"], 1, "{rebound}");
+    assert_eq!(rebound["duplicate_files"], 0, "{rebound}");
+}
+
+#[test]
 fn native_apply_caches_mappings_without_refresh_and_keeps_writes_incremental() {
     let (_dir, mut options) = setup();
     options.chunk_size = 128 * 1024;

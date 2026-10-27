@@ -32,7 +32,7 @@ struct Cli {
     /// Persistent SQLite index. Use the same index and roots on subsequent runs.
     #[arg(long, default_value = "dedupit.sqlite")]
     database: PathBuf,
-    /// Apply native, kernel-verified sharing where supported.
+    /// Share matching ranges between scan batches, using kernel verification.
     #[arg(long)]
     apply: bool,
     #[arg(long, value_enum, default_value = "both")]
@@ -43,7 +43,8 @@ struct Cli {
     /// Rehash all files; useful on filesystems with unreliable metadata timestamps.
     #[arg(long)]
     verify: bool,
-    /// Change discovery strategy. Btrfs tree searches require CAP_SYS_ADMIN.
+    /// Change discovery strategy. Native btrfs discovery requires CAP_SYS_ADMIN
+    /// and can mount hidden subvolume roots through restricted detached mounts.
     #[arg(long, value_enum, default_value = "auto")]
     scanner: Scanner,
     /// Operations per durable commit; unfinished batches are replayed after a crash.
@@ -138,6 +139,7 @@ fn main() -> Result<()> {
             stats.duplicate_chunk_bytes
         );
         if cli.apply {
+            println!("Sharing passes during scan: {}", stats.interleaved_batches);
             println!(
                 "Native sharing: {}/{} jobs completed, {} logical bytes accepted, {} already shared, {} unsupported, {} stale",
                 stats.jobs_completed, stats.jobs_attempted, stats.bytes_deduped,

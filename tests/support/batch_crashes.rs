@@ -183,6 +183,7 @@ pub(super) fn crash_at(case: &Crash<'_>) -> Observation {
                 "apply:before-mapping-sync"
                     | "apply:mappings-synced"
                     | "apply:after-mapping-confirm"
+                    | "interleave:shared"
             )
     );
     let (durable, before) = durable_state(case.database);
@@ -257,6 +258,47 @@ fn run(options: &Options, apply: bool) -> Value {
     let stats: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stats["errors"], serde_json::json!([]));
     stats
+}
+
+#[test]
+fn interleaved_sharing_recovers_crashes_before_the_scan_finishes() {
+    for portable in [true, false] {
+        for (event, hit) in [
+            ("apply:shared", 3),
+            ("interleave:shared", 1),
+            (
+                if portable {
+                    "portable:staged"
+                } else {
+                    "native-file:staged"
+                },
+                70,
+            ),
+        ] {
+            let Some((_dir, options, contents)) = fixture(portable) else {
+                continue;
+            };
+            let observation = crash_at(&Crash {
+                database: &options.database,
+                root: &options.roots[0],
+                portable,
+                apply: true,
+                event,
+                hit,
+                batch_size: 64,
+            });
+            let indexed = observation.durable["files"].as_u64().unwrap();
+            assert!(
+                indexed >= 2 && indexed < contents.len() as u64,
+                "sharing waited for the full scan: {indexed}"
+            );
+            if event != "apply:shared" {
+                assert!(observation.durable["completed"].as_u64().unwrap() > 0);
+            }
+            run(&options, true);
+            verify(&options, &contents);
+        }
+    }
 }
 
 #[test]
