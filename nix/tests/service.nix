@@ -19,7 +19,7 @@ pkgs.testers.runNixOSTest {
     start_all()
     machine.wait_for_unit("multi-user.target")
     machine.succeed("mkfs.btrfs /dev/vdb")
-    machine.succeed("mkdir /mnt/fixture && mount /dev/vdb /mnt/fixture")
+    machine.succeed("mkdir -p /mnt/fixture && mount /dev/vdb /mnt/fixture")
     machine.succeed("btrfs subvolume create /mnt/fixture/one")
     machine.succeed("btrfs subvolume create /mnt/fixture/two")
     machine.succeed("dd if=/dev/urandom of=/mnt/fixture/one/a bs=1M count=2 status=none")
