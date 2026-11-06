@@ -1,3 +1,4 @@
+mod inventory;
 mod service;
 
 use anyhow::Result;

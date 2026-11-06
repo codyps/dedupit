@@ -104,47 +104,50 @@ Reports are private files in `--state-directory` (default `/var/lib/dedupit`):
 - `filesystem-result.json`: last complete run's statistics, including file errors.
   An interrupted or paused run does not replace it.
 
-The `All recorded` column includes live work and interrupted scans. Snapshot
-deltas are persisted with the current scan, so restarting retains previously
-recorded activity without counting a snapshot twice. A final snapshot is saved
-on graceful cancellation or scan failure; a forced kill can lose work since the
-last snapshot. JSON exposes these counters as `status.activity`; the older
-`status.totals` counters retain their completed-run meaning. Separate counters
-track completed, partial, failed, paused, and interrupted scans.
+`stats` separates **Current sharing estimate (indexed files)** from
+**Dedupit activity history**. The current estimate is rebuilt from a consistent
+SQLite snapshot of the latest extent mappings; it does not add up run counters.
+It counts overlapping references to the same physical extents, so it includes
+sharing already present before dedupit (reflinks, snapshots, and other dedupe
+tools). Whole-volume services also count the current hardlink multiplicity.
 
-The service records its phase, including opening the index, scanning, summarizing,
-and sharing. Duplicate-group counts are only available after summarization and
-show `-` while the scan is unfinished. The number of scans started is shown even
-before the first scan completes. Migration retains old completed counters and
-any saved unfinished snapshot; work lost by older versions cannot be recovered.
-Earlier one-shot reports remain readable.
-Human-readable output groups counts, uses binary size units and compact elapsed
-times, and compares current, last-complete, and cumulative counters in columns.
-`stats` also reads the live database footprint (DB + WAL + SHM file sizes); JSON
-includes this as `database` with byte counts, or `null` before index creation.
-File sizes are sampled separately and can change while the service is running.
-Bytes deduped
-are **logical bytes accepted by the kernel**, not measured physical savings.
-`Saved (uncompressed)` always shows the recorded logical bytes deduplicated,
-including earlier work for which no physical measurement exists.
-`Physical estimate` is shown when physical measurements are available; it
-is a conservative estimate of cumulative Btrfs physical data
-allocations replaced by successful deduplication. The estimator compares FIEMAP
-before and after sharing, requires previously unshared complete allocations,
-and reads the file-extent allocation size (including compression) and reference
-count. Shared allocations, holes, and already-shared data are assigned zero;
-partial or uncertain mappings remain unmeasured. Estimation failures do not
-prevent deduplication. Physical measurement gaps never hide the uncompressed
-savings. The optional physical row uses `-` for columns without measurements.
-`Estimate scanned` always shows the logical byte count examined for the physical
-estimate; `Physical coverage` also shows its share of each logical total.
-JSON retains coverage counters for identifying unmeasured logical bytes, including
-work done before physical estimation was introduced.
-JSON records `estimated_bytes_saved` and `savings_measured_bytes` in scan reports,
-completed totals, and live activity. The estimate excludes metadata and RAID
-replication and can differ from current free space due to snapshots, concurrent
-writes, later modifications/deletion, and deferred Btrfs transaction processing.
-It is a gross estimate of recorded work, not a measurement of net free space.
+The inventory verifies indexed file identities/metadata and excludes files
+awaiting reconciliation. It starts after restart recovery has queued uncertain
+old mappings; fresh mappings from successful sharing are included immediately,
+even before the scan's final durability-confirmation barrier. It shows the verified/indexed file count, represented file
+bytes, queued reconciliation jobs, and age. While refreshing it also shows the
+amount of file and extent data examined. The estimate covers the indexed subset,
+not undiscovered files or the entire volume before indexing has caught up.
+Deleted/changed files are excluded, and repeated inventories do not accumulate
+savings. The background refresh uses metadata, not a second content/hash scan,
+and normally repeats every five minutes. Its private progress/cache file is
+`sharing-inventory.json`; JSON stats expose it as `sharing_inventory`.
+
+`Saved (uncompressed)` is the currently redundant logical extent data among
+verified indexed files, including hardlinks for whole-volume services.
+`Physical estimate` accounts for encoded allocation sizes; its indented
+`Coverage` line gives the reference data amount represented by that estimate.
+Partial compressed allocations and inline metadata may be outside that physical
+coverage. These estimates omit metadata/RAID overhead and are not a historical
+accounting of free bytes. Sharing origin is not distinguishable from the extent
+layout: the estimate includes all represented sharing, regardless of its creator.
+
+Activity history uses `Recorded work` for cumulative counters, including live
+and interrupted runs. `Dedupe accepted` is logical bytes accepted by sharing
+operations, not current storage savings; reprocessing may count work again.
+Snapshot deltas persist activity without counting the same snapshot twice.
+Per-run physical-release estimates remain in JSON (`estimated_bytes_saved` and
+`savings_measured_bytes`) for diagnostic use; they are not presented as current
+savings. There is one physical estimate in the human-readable output, and its
+indented coverage amount and percentage apply to that estimate alone.
+
+The service records its phase and persists a final activity snapshot on graceful
+cancellation. A forced kill can lose activity since the last report; committed
+index data remains reusable. Completed-run counters retain their old meaning.
+Duplicate-group counts await scan completion. Earlier one-shot reports remain
+readable. Roots/chunk configuration still bind the incremental index.
+`stats` also reads the database footprint (DB + WAL + SHM file sizes) as
+`database` in JSON. File sizes can change during measurement.
 
 A crash or forced kill can leave the latest status stale; `stats` shows its age.
 Reports use atomic replacement. Fatal scan failures and busy files are logged

@@ -186,14 +186,14 @@ struct Status {
     phase: &'static str,
 }
 
-fn now() -> u64 {
+pub(super) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
 
-fn save(path: &Path, value: &impl Serialize) -> Result<()> {
+pub(super) fn save(path: &Path, value: &impl Serialize) -> Result<()> {
     // Same-directory rename gives readers a complete old or new report. A
     // unique, exclusively created temporary file also survives stale crash debris.
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -227,7 +227,7 @@ fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T
     }
 }
 
-fn free_bytes(path: &Path) -> Result<u64> {
+pub(super) fn free_bytes(path: &Path) -> Result<u64> {
     let path = CString::new(path.as_os_str().as_bytes())?;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: valid NUL-terminated path and writable statvfs output.
@@ -246,6 +246,8 @@ struct Monitor {
     status: RefCell<Status>,
     checked: RefCell<Instant>,
     reported: RefCell<Instant>,
+    inventory: RefCell<Option<crate::inventory::Worker>>,
+    inventory_hardlinks: bool,
 }
 impl Monitor {
     fn write(&self) -> Result<()> {
@@ -280,6 +282,17 @@ impl Monitor {
 impl RunObserver for Monitor {
     fn phase(&self, phase: &'static str) -> Result<()> {
         self.checkpoint()?;
+        // Start only after Index::open has queued any unconfirmed mappings
+        // from a previous process. During this live process, newly captured
+        // provisional maps reflect successful sharing and belong in the estimate.
+        let start_inventory = phase == "Scanning files" && self.inventory.borrow().is_none();
+        if start_inventory {
+            *self.inventory.borrow_mut() = Some(crate::inventory::Worker::start(
+                self.directory.clone(),
+                self.inventory_hardlinks,
+                self.minimum,
+            ));
+        }
         {
             let mut status = self.status.borrow_mut();
             status.phase = phase;
@@ -480,6 +493,8 @@ pub fn run(args: ServiceArgs) -> Result<()> {
         }),
         checked: RefCell::new(Instant::now()),
         reported: RefCell::new(Instant::now()),
+        inventory: RefCell::new(None),
+        inventory_hardlinks: args.device.is_some(),
     });
     while !STOP.load(Ordering::Relaxed) {
         {
@@ -617,11 +632,12 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         );
     }
     let database = database_size(&args.state_directory)?;
+    let inventory = crate::inventory::read(&args.state_directory)?;
     if args.json {
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &serde_json::json!({"status": status, "last_result": result, "database": database})
+                &serde_json::json!({"status": status, "last_result": result, "database": database, "sharing_inventory": inventory})
             )?
         );
         return Ok(());
@@ -685,10 +701,68 @@ pub fn stats(args: StatsArgs) -> Result<()> {
     } else {
         println!("  Database     Not created yet");
     }
+    println!("\nCurrent sharing estimate (indexed files)");
+    if let Some(inventory) = &inventory {
+        let best = inventory
+            .estimate
+            .as_ref()
+            .or_else(|| (inventory.refresh.mapped_data_bytes > 0).then_some(&inventory.refresh));
+        if let Some(best) = best {
+            println!(
+                "  Saved (uncompressed)   {}",
+                size(best.saved_uncompressed_bytes)
+            );
+            println!(
+                "  Physical estimate      {}",
+                if best.physical_covered_bytes > 0 {
+                    size(best.physical_estimate_bytes)
+                } else {
+                    "-".into()
+                }
+            );
+            let pct = if best.referenced_data_bytes == 0 {
+                0.0
+            } else {
+                best.physical_covered_bytes as f64 / best.referenced_data_bytes as f64 * 100.0
+            };
+            println!(
+                "    Coverage             {} / {} ({pct:.1}%)",
+                size(best.physical_covered_bytes),
+                size(best.referenced_data_bytes)
+            );
+            println!(
+                "  Based on               {} / {} indexed files · {} checked · {} ago",
+                count(best.verified_files),
+                count(best.indexed_files),
+                size(best.checked_file_bytes),
+                elapsed(now().saturating_sub(best.as_of))
+            );
+            println!(
+                "  Index reconciliation   {} queued jobs",
+                count(best.pending_jobs)
+            );
+        }
+        if inventory.state != "Complete" {
+            println!(
+                "  {}: {} / {} indexed files · {} checked · {} extent data examined",
+                inventory.state,
+                count(inventory.refresh.checked_files),
+                count(inventory.refresh.indexed_files),
+                size(inventory.refresh.checked_file_bytes),
+                size(inventory.refresh.mapped_data_bytes)
+            );
+        }
+        if let Some(error) = &inventory.error {
+            println!("  Inventory error        {error}");
+        }
+    } else {
+        println!("  Inventory starting");
+    }
+    println!("\nDedupit activity history");
     println!();
     println!(
         "  {:<22} {:>17} {:>17} {:>17}",
-        "", "This scan", "Last complete", "All recorded"
+        "", "This scan", "Last complete", "Recorded work"
     );
     let row = |label: &str, a: Option<u64>, b: Option<u64>, c: Option<u64>, bytes: bool| {
         let value = |n: Option<u64>| {
@@ -724,74 +798,12 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         true,
     );
     row(
-        "Saved (uncompressed)",
+        "Dedupe accepted",
         progress.as_ref().map(|s| s.bytes_deduped),
         result.as_ref().map(|s| s.bytes_deduped),
         Some(activity.bytes_deduped),
         true,
     );
-    let physical = |stats: &Stats| {
-        if stats.savings_measured_bytes > 0 {
-            size(stats.estimated_bytes_saved)
-        } else {
-            "-".into()
-        }
-    };
-    if activity.savings_measured_bytes > 0
-        || progress
-            .as_ref()
-            .is_some_and(|s| s.savings_measured_bytes > 0)
-        || result
-            .as_ref()
-            .is_some_and(|s| s.savings_measured_bytes > 0)
-    {
-        println!(
-            "  {:<22} {:>17} {:>17} {:>17}",
-            "Physical estimate",
-            progress
-                .as_ref()
-                .map(physical)
-                .unwrap_or_else(|| "-".into()),
-            result.as_ref().map(physical).unwrap_or_else(|| "-".into()),
-            if activity.savings_measured_bytes > 0 {
-                size(activity.estimated_bytes_saved)
-            } else {
-                "-".into()
-            }
-        );
-    }
-    row(
-        "Estimate scanned",
-        progress.as_ref().map(|s| s.savings_measured_bytes),
-        result.as_ref().map(|s| s.savings_measured_bytes),
-        Some(activity.savings_measured_bytes),
-        true,
-    );
-    if activity.savings_measured_bytes > 0 {
-        let coverage = |bytes: u64, measured: u64| {
-            if bytes == 0 {
-                "-".to_string()
-            } else {
-                format!(
-                    "{:.1}%",
-                    (measured.min(bytes) as f64) / bytes as f64 * 100.0
-                )
-            }
-        };
-        println!(
-            "  {:<22} {:>17} {:>17} {:>17}",
-            "Physical coverage",
-            progress
-                .as_ref()
-                .map(|s| coverage(s.bytes_deduped, s.savings_measured_bytes))
-                .unwrap_or_else(|| "-".into()),
-            result
-                .as_ref()
-                .map(|s| coverage(s.bytes_deduped, s.savings_measured_bytes))
-                .unwrap_or_else(|| "-".into()),
-            coverage(activity.bytes_deduped, activity.savings_measured_bytes)
-        );
-    }
     row(
         "Already shared",
         progress.as_ref().map(|s| s.bytes_already_shared),

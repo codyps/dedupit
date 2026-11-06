@@ -120,7 +120,7 @@ fn service_repeats_records_statistics_and_resumes_index_and_totals_after_sigterm
     assert!(human.status.success());
     assert!(String::from_utf8(human.stdout)
         .unwrap()
-        .contains("All recorded"));
+        .contains("Recorded work"));
     restarted.stop();
 }
 

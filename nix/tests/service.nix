@@ -43,6 +43,13 @@ pkgs.testers.runNixOSTest {
     assert report["last_result"]["errors"] == [], report
     assert report["status"]["activity"]["estimated_bytes_saved"] >= 2 * 1024 * 1024, report
     assert report["status"]["activity"]["savings_measured_bytes"] > 0, report
+    machine.wait_until_succeeds("dedupit stats --json | grep -q '\"saved_uncompressed_bytes\": [1-9]'")
+    current = json.loads(machine.succeed("dedupit stats --json"))["sharing_inventory"]
+    best = current["estimate"] or current["refresh"]
+    # The prior hardlinks existed before dedupit. The current inventory must
+    # include their sharing, rather than merely sum this tool's accepted work.
+    assert best["saved_uncompressed_bytes"] >= 200 * 2 * 1024 * 1024, current
+    assert best["checked_file_bytes"] > 0 and best["verified_files"] > 0, current
     machine.fail("mountpoint /run/dedupit/filesystem")
     machine.succeed("cmp /mnt/fixture/one/a /mnt/fixture/two/b")
     machine.succeed("systemctl stop dedupit.service")
