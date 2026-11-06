@@ -3,6 +3,7 @@
 //! a newer COW leaf can still contain older, unprocessed inode items.
 use anyhow::{bail, ensure, Context, Result};
 use std::{
+    collections::{HashMap, HashSet},
     fs::File,
     io,
     os::{fd::AsRawFd, unix::ffi::OsStrExt},
@@ -385,10 +386,12 @@ fn raw_paths(file: &File, ino: u64) -> Result<Vec<PathBuf>> {
     let missing = u32::from_ne_bytes(bytes[4..8].try_into()?);
     let count = u32::from_ne_bytes(bytes[8..12].try_into()?) as usize;
     let missed = u32::from_ne_bytes(bytes[12..16].try_into()?);
-    ensure!(
-        missing == 0 && missed == 0,
-        "inode path buffer overflow; use --scanner portable for this hardlink set"
-    );
+    // INO_PATHS is capped by the kernel at 4 KiB, even if userspace supplies
+    // a larger buffer. Never use an incomplete alias set: a missing name may
+    // be the only alias inside the requested scan roots.
+    if missing != 0 || missed != 0 {
+        return paths_from_references(ino, |ino| inode_references(file, ino));
+    }
     ensure!(count <= (4096 - 16) / 8, "invalid inode path count");
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
@@ -404,6 +407,108 @@ fn raw_paths(file: &File, ino: u64) -> Result<Vec<PathBuf>> {
             .context("unterminated inode path")?;
         result.push(relative(&value[..end])?);
     }
+    Ok(result)
+}
+
+// INODE_REF and INODE_EXTREF store all (parent inode, basename) pairs and
+// TREE_SEARCH_V2 paginates them without INO_PATHS' aggregate path-size cap.
+fn inode_references(file: &File, ino: u64) -> Result<Vec<(u64, PathBuf)>> {
+    let mut key = Key {
+        ino,
+        kind: 12,
+        offset: 0,
+    };
+    let end = Key {
+        ino,
+        kind: 13,
+        offset: u64::MAX,
+    };
+    let mut result = Vec::new();
+    loop {
+        let page = search(file, 0, key, end, 0)?;
+        if page.is_empty() {
+            break;
+        }
+        for item in &page {
+            result.extend(parse_references(item)?);
+        }
+        match page.last().and_then(|item| item.key.next()) {
+            Some(next) if next <= end => key = next,
+            _ => break,
+        }
+    }
+    result.sort();
+    result.dedup();
+    Ok(result)
+}
+
+fn parse_references(item: &Item) -> Result<Vec<(u64, PathBuf)>> {
+    ensure!(
+        [12, 13].contains(&item.key.kind),
+        "invalid inode reference type"
+    );
+    let header = if item.key.kind == 12 { 10 } else { 18 };
+    let mut data = item.data.as_slice();
+    let mut result = Vec::new();
+    while !data.is_empty() {
+        ensure!(data.len() >= header, "truncated inode reference");
+        let parent = if item.key.kind == 12 {
+            item.key.offset
+        } else {
+            le64(data, 0)?
+        };
+        ensure!(parent >= 256, "invalid inode reference parent");
+        let length = u16::from_le_bytes(data[header - 2..header].try_into()?) as usize;
+        ensure!(
+            (1..=255).contains(&length),
+            "invalid inode reference name length"
+        );
+        let name = data
+            .get(header..header + length)
+            .context("truncated inode reference name")?;
+        ensure!(
+            !name.contains(&b'/') && !name.contains(&0),
+            "invalid inode reference name"
+        );
+        result.push((parent, relative(name)?));
+        data = &data[header + length..];
+    }
+    Ok(result)
+}
+
+fn paths_from_references(
+    ino: u64,
+    mut references: impl FnMut(u64) -> Result<Vec<(u64, PathBuf)>>,
+) -> Result<Vec<PathBuf>> {
+    let aliases = references(ino)?;
+    let mut directories = HashMap::from([(256, PathBuf::new())]);
+    let mut result = Vec::with_capacity(aliases.len());
+    for (parent, name) in aliases {
+        let mut current = parent;
+        let mut chain = Vec::new();
+        let mut visited = HashSet::new();
+        while !directories.contains_key(&current) {
+            ensure!(visited.insert(current), "cycle in inode reference ancestry");
+            let parents = references(current)?;
+            ensure!(
+                parents.len() == 1,
+                "directory ancestry changed during path lookup"
+            );
+            let (next, basename) = parents.into_iter().next().unwrap();
+            chain.push((current, basename));
+            current = next;
+        }
+        let mut path = directories[&current].clone();
+        for (directory, basename) in chain.into_iter().rev() {
+            path.push(basename);
+            directories.insert(directory, path.clone());
+        }
+        result.push(path.join(name));
+    }
+    result.sort();
+    result.dedup();
+    // Concurrent renames can change these metadata paths. All consumers still
+    // reopen without following symlinks and validate inode/subvolume identity.
     Ok(result)
 }
 
@@ -540,6 +645,62 @@ mod tests {
             }
         );
     }
+    #[test]
+    fn inode_references_decode_regular_and_extended_items_and_reject_bad_names() {
+        for kind in [12, 13] {
+            let mut data = Vec::new();
+            if kind == 13 {
+                data.extend_from_slice(&300u64.to_le_bytes());
+            }
+            data.extend_from_slice(&7u64.to_le_bytes());
+            data.extend_from_slice(&4u16.to_le_bytes());
+            data.extend_from_slice(b"file");
+            let mut item = Item {
+                key: Key {
+                    ino: 400,
+                    kind,
+                    offset: 300,
+                },
+                data,
+            };
+            assert_eq!(
+                parse_references(&item).unwrap(),
+                vec![(300, PathBuf::from("file"))]
+            );
+            item.data.pop();
+            assert!(parse_references(&item).is_err());
+            item.data.push(0);
+            assert!(parse_references(&item).is_err());
+        }
+    }
+
+    #[test]
+    fn reference_paths_keep_every_alias_and_reject_ancestry_cycles() {
+        let aliases: Vec<_> = (0..400)
+            .map(|n| {
+                (
+                    300,
+                    PathBuf::from(format!("alias-{n:04}-{}", "x".repeat(100))),
+                )
+            })
+            .collect();
+        let paths = paths_from_references(400, |ino| {
+            Ok(match ino {
+                400 => aliases.clone(),
+                300 => vec![(256, PathBuf::from("dir"))],
+                _ => panic!("unexpected parent"),
+            })
+        })
+        .unwrap();
+        assert_eq!(paths.len(), 400);
+        assert!(paths.iter().all(|p| p.starts_with("dir")));
+        assert!(paths_from_references(400, |ino| Ok(vec![(
+            if ino == 400 { 300 } else { ino },
+            PathBuf::from("cycle")
+        )]))
+        .is_err());
+    }
+
     #[test]
     fn reject_bad_pages_and_paths() {
         assert!(parse_page(&[0; 31], 1, Key::FIRST, Key::LAST).is_err());
