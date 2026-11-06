@@ -57,8 +57,108 @@ do not add them together.
 
 Default chunk size is 128 KiB. Supported sizes are powers of two from 4 KiB to
 16 MiB. Smaller chunks find finer partial matches at the cost of more index
-space, hashing, and ioctl calls. There is no background service: schedule the
-same command periodically for continuous incremental operation.
+space, hashing, and ioctl calls. Use `dedupit service` for continuous incremental
+operation, or schedule the original one-shot command yourself.
+
+## Native service and statistics
+
+The foreground service handles scheduling, SIGTERM/SIGINT, disk-space checks,
+and report persistence inside the Rust process. No shell or Python supervisor
+is needed. Sharing remains opt-in on the command line:
+
+```sh
+# Directory service; wait an hour between runs and pause below 5 GiB free.
+sudo dedupit service --state-directory /var/lib/dedupit --apply /data
+
+# Linux/Btrfs: privately mount the top-level tree and scan every subvolume.
+# Includes hidden subvolumes and bypasses read-only bind mounts of the Nix store.
+sudo dedupit service --device /dev/mapper/root --scanner btrfs --apply
+
+# Current progress, last complete report, and cumulative counters.
+sudo dedupit stats
+sudo dedupit stats --json
+```
+
+`--interval SECONDS` defaults to 3600 seconds after a run finishes or pauses.
+`--minimum-free-bytes BYTES` defaults to 5368709120 (5 GiB), checked before
+opening the index and every 30 seconds during work. The guard measures available
+space on the **state-directory filesystem**; put the index on the scanned
+volume when that volume needs protection. It is a polling guard, not a quota.
+`--chunk-size` defaults to 1 MiB for the service, matching whole-volume usage.
+Roots, chunk size and granularity remain bound to the index.
+
+`--device` requires root/CAP_SYS_ADMIN and an already available Btrfs block
+device. The process makes its own mount namespace private and mounts
+`subvolid=5` using native syscalls. Its default mount path is
+`STATE_DIRECTORY/filesystem`; `--mount-directory` selects another stable path.
+The mount disappears on exit and never appears in the host namespace. Do not
+change that path when reusing an index. Existing directory-based invocations
+and portable scanning still work without whole-volume privileges.
+
+Reports are private files in `--state-directory` (default `/var/lib/dedupit`):
+
+- `filesystem.sqlite`: incremental index, reusable after interruption.
+- `filesystem-status.json`: state, timestamps (Unix seconds), free space,
+  current/latest run counters, errors, and cumulative totals. Updated at most
+  every five seconds when work reaches a checkpoint, and at run boundaries.
+- `filesystem-result.json`: last complete run's statistics, including file errors.
+  An interrupted or paused run does not replace it.
+
+Cumulative byte/file/job counters cover completed runs recorded by the native
+service, including runs with per-file errors. Separate counters track partial,
+failed, paused, and interrupted runs. Earlier one-shot reports remain readable;
+new cumulative totals start when the native service is first used. Bytes deduped
+are **logical bytes accepted by the kernel**, not measured physical savings.
+A crash or forced kill can leave the latest status stale; `stats` shows its age.
+Reports use atomic replacement. Fatal scan failures and busy files are logged
+and retried at the next interval. A failure to persist reports exits the service.
+Only one service may own a state directory, including while waiting between runs.
+
+Cancellation checkpoints run between metadata pages, files, hash chunks, and
+sharing ioctls. Stopping rolls back the active SQLite batch; committed progress
+remains reusable. A kernel operation or database migration can delay stopping;
+a service manager may still impose a stop timeout.
+
+## Nix and NixOS
+
+```sh
+nix build .#dedupit
+nix develop -c cargo test --locked --features test-failpoints
+```
+
+The flake exports `packages.<system>.dedupit` (also `default`) and
+`nixosModules.default` (also `dedupit`). Import the NixOS module with the host's
+Nixpkgs; it builds the package with that same package set:
+
+```nix
+# flake.nix inputs
+inputs.dedupit.url = "git+ssh://git@github.com/codyps/dedupit.git";
+inputs.dedupit.inputs.nixpkgs.follows = "nixpkgs";
+
+# NixOS modules list
+modules = [
+  inputs.dedupit.nixosModules.default
+  {
+    services.dedupit = {
+      enable = true;
+      device = "/dev/mapper/root";
+      # apply = true;                 # false selects report-only mode
+      # interval = 3600;
+      # minimumFreeBytes = 5368709120;
+      # chunkSize = 1048576;
+    };
+  }
+];
+```
+
+`dedupit.service` starts at boot and runs the binary directly. There is no timer,
+mount helper, or interpreter. The module persists state in `/var/lib/dedupit`
+and mounts the volume at `/run/dedupit/filesystem` inside the service namespace.
+It uses idle I/O scheduling, nice 19, a 2 GiB memory soft limit and a 4 GiB hard
+limit. Systemd retries process failures after five minutes and allows 45 seconds
+to stop. These standard unit settings can be overridden in the host configuration.
+The package, including `dedupit stats`, is installed in the system profile.
+On an ephemeral-root system, persist `/var/lib/dedupit` or its parent.
 
 With `--apply`, sharing runs between committed scan batches, so duplicates can
 start sharing storage before the full scan finishes. Each sharing pass considers

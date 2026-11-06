@@ -243,6 +243,7 @@ fn portable(
     sharing.between_batches(index, stats)?;
     for root in index.roots.clone() {
         for entry in WalkDir::new(&root).follow_links(false).max_open(32) {
+            index.progress(stats)?;
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -517,6 +518,7 @@ fn index_file_inner(
     // One lazily grown scratch buffer per run, shared by portable and native
     // scans. Small/empty files and metadata-only changes need no full-size
     // allocation, and unchanged files never touch the buffer.
+    let observer = index.observer.clone();
     let buffer = &mut index.buffer;
     if !dirty.is_empty() {
         let needed = before.len().min(options.chunk_size as u64) as usize;
@@ -535,6 +537,9 @@ fn index_file_inner(
     for (start, end) in &dirty {
         let mut offset = *start;
         while offset < *end {
+            if let Some(observer) = &observer {
+                observer.progress(stats)?;
+            }
             if sparse_supported {
                 match next_data(&file, offset) {
                     Ok(Some(data)) => {

@@ -10,6 +10,7 @@ use std::{
 };
 
 pub(crate) struct Index {
+    pub observer: Option<std::rc::Rc<dyn crate::RunObserver>>,
     pub conn: Connection,
     pub roots: Vec<PathBuf>,
     pub excluded: Vec<PathBuf>,
@@ -62,6 +63,7 @@ impl<'a> Interleaver<'a> {
     }
 
     pub fn between_batches(&mut self, index: &mut Index, stats: &mut Stats) -> Result<()> {
+        index.progress(stats)?;
         let Some(backend) = self.backend.as_deref_mut() else {
             return Ok(());
         };
@@ -406,6 +408,7 @@ impl Index {
             conn.pragma_update(None, "cache_size", 8)?;
         }
         Ok(Self {
+            observer: None,
             conn,
             roots: reduced,
             excluded,
@@ -428,6 +431,20 @@ impl Index {
             _lock: lock,
             _database: db_file,
         })
+    }
+
+    pub fn checkpoint(&self) -> Result<()> {
+        if let Some(observer) = &self.observer {
+            observer.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    pub fn progress(&self, stats: &Stats) -> Result<()> {
+        if let Some(observer) = &self.observer {
+            observer.progress(stats)?;
+        }
+        Ok(())
     }
 
     pub fn begin_batch(&mut self, phase: &'static str) -> Result<()> {
@@ -496,6 +513,7 @@ impl Index {
     }
 
     pub fn check_batch(&self) -> Result<()> {
+        self.checkpoint()?;
         ensure!(
             !self.batch.poisoned,
             "file cleanup failed; database batch must be rolled back on restart"
@@ -622,6 +640,7 @@ impl Index {
         for kind in [1, 0] {
             let mut cursor = 0;
             loop {
+                self.progress(stats)?;
                 let target = self.next_pending(kind, cursor)?;
                 let Some(target) = target else { break };
                 cursor = target.id;
@@ -780,6 +799,7 @@ impl Index {
             let mut complete = true;
             let mut mapping_changed = false;
             while done < target.len {
+                self.progress(stats)?;
                 let len = (target.len - done).min(16 * 1024 * 1024);
                 let result = backend.dedupe(
                     &source_file,

@@ -15,7 +15,7 @@ mod scan;
 
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::{path::PathBuf, rc::Rc};
 
 pub use backend::{Backend, NativeBackend, Outcome, Range};
 
@@ -50,7 +50,8 @@ pub struct Options {
     pub commit_batch_size: usize,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Stats {
     /// Explicit scan/apply batch commits, excluding startup and maintenance SQL.
     pub database_batches: u64,
@@ -105,6 +106,25 @@ pub fn list_duplicates(
     index.list_duplicates(&mut visit)
 }
 
+/// Cooperative service control. Errors abort the current batch, leaving committed
+/// progress reusable. Callbacks run on the scanning thread; they must not block.
+pub trait RunObserver {
+    fn checkpoint(&self) -> Result<()>;
+    fn progress(&self, _stats: &Stats) -> Result<()> {
+        self.checkpoint()
+    }
+}
+
+/// Run with cooperative cancellation and progress reporting, without spawning
+/// a worker or requiring an external supervisor.
+pub fn run_observed(
+    options: &Options,
+    apply: bool,
+    observer: Rc<dyn RunObserver>,
+) -> Result<Stats> {
+    run_inner(options, apply, &mut NativeBackend, Some(observer))
+}
+
 /// Discovery commits each stable file atomically. Applying is restartable and
 /// only records work after a backend reports full success.
 pub fn run(options: &Options, apply: bool) -> Result<Stats> {
@@ -116,6 +136,18 @@ pub fn run_with_backend(
     apply: bool,
     backend: &mut impl Backend,
 ) -> Result<Stats> {
+    run_inner(options, apply, backend, None)
+}
+
+fn run_inner(
+    options: &Options,
+    apply: bool,
+    backend: &mut impl Backend,
+    observer: Option<Rc<dyn RunObserver>>,
+) -> Result<Stats> {
+    if let Some(observer) = &observer {
+        observer.checkpoint()?;
+    }
     ensure!(
         (4096..=16 * 1024 * 1024).contains(&options.chunk_size)
             && options.chunk_size.is_power_of_two(),
@@ -127,6 +159,7 @@ pub fn run_with_backend(
         "commit batch size must be between 1 and 4096"
     );
     let mut index = index::Index::open(options)?;
+    index.observer = observer;
     let mut stats = Stats::default();
     let mut sharing = index::Interleaver::new(if apply { Some(backend) } else { None });
     scan::scan(&mut index, options, &mut stats, &mut sharing).context("scanning files")?;
@@ -135,5 +168,6 @@ pub fn run_with_backend(
     sharing.finish(&mut index, &mut stats)?;
     index.flush_batch()?;
     stats.database_batches = index.batch_commits();
+    index.progress(&stats)?;
     Ok(stats)
 }

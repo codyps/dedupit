@@ -1,3 +1,5 @@
+mod service;
+
 use anyhow::Result;
 use clap::Parser;
 use dedupit::{Granularity, Options, Scanner};
@@ -26,9 +28,13 @@ struct DuplicateRecord<'a> {
 #[derive(Parser)]
 #[command(
     version,
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true,
     about = "Incremental full-file and extent deduplication. Reports duplicates unless --apply is given."
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Persistent SQLite index. Use the same index and roots on subsequent runs.
     #[arg(long, default_value = "dedupit.sqlite")]
     database: PathBuf,
@@ -60,8 +66,21 @@ struct Cli {
     roots: Vec<PathBuf>,
 }
 
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Run incremental scans continuously, with native supervision and reports.
+    Service(service::ServiceArgs),
+    /// Show current progress, the last report, and persistent cumulative totals.
+    Stats(service::StatsArgs),
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Service(args)) => return service::run(args),
+        Some(Command::Stats(args)) => return service::stats(args),
+        None => {}
+    }
     let options = Options {
         database: cli.database,
         roots: cli.roots,

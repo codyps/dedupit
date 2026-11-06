@@ -771,3 +771,31 @@ fn native_btrfs_physically_shares_ranges_and_recognizes_existing_sharing() {
         Outcome::AlreadyShared(128 * 1024)
     );
 }
+
+#[test]
+fn cooperative_stop_during_large_file_rolls_back_and_can_resume() {
+    use dedupit::RunObserver;
+    use std::{cell::Cell, rc::Rc};
+    struct StopAfterChunk(Cell<bool>);
+    impl RunObserver for StopAfterChunk {
+        fn checkpoint(&self) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.0.get(), "test cancellation");
+            Ok(())
+        }
+        fn progress(&self, stats: &dedupit::Stats) -> anyhow::Result<()> {
+            if stats.bytes_hashed >= 4096 {
+                self.0.set(true);
+            }
+            self.checkpoint()
+        }
+    }
+    let (_dir, options) = setup(Granularity::Both);
+    put(&options, "a", &vec![1; 65536]);
+    let error = dedupit::run_observed(&options, false, Rc::new(StopAfterChunk(Cell::new(false))))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("test cancellation"));
+    let resumed = run(&options, false).unwrap();
+    assert_eq!(resumed.files_hashed, 1);
+    assert_eq!(resumed.bytes_hashed, 65536);
+    assert_eq!(run(&options, false).unwrap().bytes_hashed, 0);
+}

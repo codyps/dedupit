@@ -403,6 +403,7 @@ fn discover_inner(
         )?;
     }
     loop {
+        index.progress(stats)?;
         index.begin_batch(if confirmation.is_some() {
             "mapping-confirm"
         } else {
@@ -510,6 +511,7 @@ fn process(
         index.conn.execute_cached("DELETE FROM attempted", [])?;
         let mut lower = i64::MIN;
         loop {
+            index.progress(stats)?;
             let Some(ino) = next_queued(&index.conn, crawl.id, directory, &mut lower)? else {
                 break;
             };
