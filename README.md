@@ -107,7 +107,12 @@ Reports are private files in `--state-directory` (default `/var/lib/dedupit`):
 Cumulative byte/file/job counters cover completed runs recorded by the native
 service, including runs with per-file errors. Separate counters track partial,
 failed, paused, and interrupted runs. Earlier one-shot reports remain readable;
-new cumulative totals start when the native service is first used. Bytes deduped
+new cumulative totals start when the native service is first used.
+Human-readable output groups counts, uses binary size units and compact elapsed
+times, and compares current, last-complete, and cumulative counters in columns.
+`stats` also reads the live database footprint (DB + WAL + SHM file sizes); JSON
+includes this as `database` with byte counts, or `null` before index creation.
+File sizes are sampled separately and can change while the service is running. Bytes deduped
 are **logical bytes accepted by the kernel**, not measured physical savings.
 A crash or forced kill can leave the latest status stale; `stats` shows its age.
 Reports use atomic replacement. Fatal scan failures and busy files are logged

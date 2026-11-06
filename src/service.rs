@@ -455,6 +455,42 @@ pub fn run(args: ServiceArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Serialize)]
+struct DatabaseSize {
+    main_bytes: u64,
+    wal_bytes: u64,
+    shm_bytes: u64,
+    total_bytes: u64,
+}
+
+fn database_size(directory: &Path) -> Result<Option<DatabaseSize>> {
+    let length = |name: &str| -> Result<Option<u64>> {
+        match fs::metadata(directory.join(name)) {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            // SQLite can remove sidecars while the service is committing.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("inspect {name}")),
+        }
+    };
+    let main = length("filesystem.sqlite")?;
+    let wal = length("filesystem.sqlite-wal")?;
+    let shm = length("filesystem.sqlite-shm")?;
+    if main.is_none() && wal.is_none() && shm.is_none() {
+        return Ok(None);
+    }
+    let main_bytes = main.unwrap_or(0);
+    let wal_bytes = wal.unwrap_or(0);
+    let shm_bytes = shm.unwrap_or(0);
+    Ok(Some(DatabaseSize {
+        main_bytes,
+        wal_bytes,
+        shm_bytes,
+        total_bytes: main_bytes
+            .saturating_add(wal_bytes)
+            .saturating_add(shm_bytes),
+    }))
+}
+
 pub fn stats(args: StatsArgs) -> Result<()> {
     let status =
         read_optional::<serde_json::Value>(&args.state_directory.join("filesystem-status.json"))?;
@@ -465,41 +501,218 @@ pub fn stats(args: StatsArgs) -> Result<()> {
             args.state_directory.display()
         );
     }
+    let database = database_size(&args.state_directory)?;
     if args.json {
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &serde_json::json!({"status": status, "last_result": result})
+                &serde_json::json!({"status": status, "last_result": result, "database": database})
             )?
         );
         return Ok(());
     }
+    let progress = status
+        .as_ref()
+        .and_then(|s| s.get("progress"))
+        .map(|v| serde_json::from_value::<Stats>(v.clone()))
+        .transpose()?;
+    let totals = status
+        .as_ref()
+        .and_then(|s| s.get("totals"))
+        .map(|v| serde_json::from_value::<Totals>(v.clone()))
+        .transpose()?;
+    println!("Dedupit");
     if let Some(status) = &status {
-        println!("State: {}", status["state"].as_str().unwrap_or("unknown"));
+        let state = match status["state"].as_str().unwrap_or("unknown") {
+            "running" => "Running",
+            "starting" => "Starting",
+            "completed" => "Waiting (last run completed)",
+            "finished_with_errors" => "Waiting (last run had file errors)",
+            "paused_for_space" => "Paused (low disk space)",
+            "interrupted" => "Interrupted",
+            "failed" => "Waiting (last run failed)",
+            "stopped" => "Stopped",
+            _ => "Unknown",
+        };
+        println!("  Status       {state}");
+        let current_time = now();
         if let Some(updated) = status["updated_at"].as_u64() {
-            println!("Updated: {} seconds ago", now().saturating_sub(updated));
+            println!(
+                "  Updated      {} ago",
+                elapsed(current_time.saturating_sub(updated))
+            );
+        }
+        if let Some(started) = status["started_at"].as_u64() {
+            let end = status["finished_at"].as_u64().unwrap_or(current_time);
+            println!("  Run duration {}", elapsed(end.saturating_sub(started)));
         }
         if let Some(free) = status["free_bytes"].as_u64() {
-            println!("Available: {free} bytes");
+            println!("  Free space   {}", size(free));
         }
         if let Some(error) = status["error"].as_str() {
-            println!("Last error: {error}");
-        }
-        if let Some(progress) = status.get("progress") {
-            println!("Current/latest run: {} files hashed, {} bytes read, {} sharing jobs, {} logical bytes deduped", progress["files_hashed"], progress["bytes_hashed"], progress["jobs_completed"], progress["bytes_deduped"]);
-        }
-        if let Some(totals) = status.get("totals") {
-            let totals: Totals = serde_json::from_value(totals.clone())?;
-            println!("Recorded runs: {} completed ({} with file errors), {} failed, {} space pauses, {} interrupted", totals.completed_runs, totals.partial_runs, totals.failed_runs, totals.paused_runs, totals.interrupted_runs);
-            println!("Completed-run totals: {} files hashed, {} bytes read, {} sharing jobs, {} logical bytes deduped, {} already shared", totals.files_hashed, totals.bytes_hashed, totals.jobs_completed, totals.bytes_deduped, totals.bytes_already_shared);
+            println!("  Last error   {error}");
         }
     }
-    if let Some(result) = result {
-        println!("Last complete report: {} files seen, {} files hashed, {} duplicate files, {} duplicate chunks, {} errors", result.files_seen, result.files_hashed, result.duplicate_files, result.duplicate_chunks, result.errors.len());
-        for error in result.errors.iter().take(10) {
-            println!("  {error}");
+    if let Some(database) = &database {
+        println!(
+            "  Database     {} total ({} DB + {} WAL + {} SHM)",
+            size(database.total_bytes),
+            size(database.main_bytes),
+            size(database.wal_bytes),
+            size(database.shm_bytes)
+        );
+    } else {
+        println!("  Database     Not created yet");
+    }
+    println!();
+    println!(
+        "  {:<22} {:>17} {:>17} {:>17}",
+        "", "Current/latest", "Last complete", "All completed"
+    );
+    let row = |label: &str, a: Option<u64>, b: Option<u64>, c: Option<u64>, bytes: bool| {
+        let value = |n: Option<u64>| {
+            n.map(|n| if bytes { size(n) } else { count(n) })
+                .unwrap_or_else(|| "-".into())
+        };
+        println!(
+            "  {label:<22} {:>17} {:>17} {:>17}",
+            value(a),
+            value(b),
+            value(c)
+        );
+    };
+    row(
+        "Files scanned",
+        progress.as_ref().map(|s| s.files_seen),
+        result.as_ref().map(|s| s.files_seen),
+        None,
+        false,
+    );
+    row(
+        "Files hashed",
+        progress.as_ref().map(|s| s.files_hashed),
+        result.as_ref().map(|s| s.files_hashed),
+        totals.as_ref().map(|s| s.files_hashed),
+        false,
+    );
+    row(
+        "Data read",
+        progress.as_ref().map(|s| s.bytes_hashed),
+        result.as_ref().map(|s| s.bytes_hashed),
+        totals.as_ref().map(|s| s.bytes_hashed),
+        true,
+    );
+    row(
+        "Deduped (logical)",
+        progress.as_ref().map(|s| s.bytes_deduped),
+        result.as_ref().map(|s| s.bytes_deduped),
+        totals.as_ref().map(|s| s.bytes_deduped),
+        true,
+    );
+    row(
+        "Already shared",
+        progress.as_ref().map(|s| s.bytes_already_shared),
+        result.as_ref().map(|s| s.bytes_already_shared),
+        totals.as_ref().map(|s| s.bytes_already_shared),
+        true,
+    );
+    row(
+        "Sharing jobs",
+        progress.as_ref().map(|s| s.jobs_completed),
+        result.as_ref().map(|s| s.jobs_completed),
+        totals.as_ref().map(|s| s.jobs_completed),
+        false,
+    );
+    row(
+        "Duplicate files",
+        progress.as_ref().map(|s| s.duplicate_files),
+        result.as_ref().map(|s| s.duplicate_files),
+        None,
+        false,
+    );
+    row(
+        "Duplicate chunks",
+        progress.as_ref().map(|s| s.duplicate_chunks),
+        result.as_ref().map(|s| s.duplicate_chunks),
+        None,
+        false,
+    );
+    row(
+        "File errors",
+        progress.as_ref().map(|s| s.errors.len() as u64),
+        result.as_ref().map(|s| s.errors.len() as u64),
+        None,
+        false,
+    );
+    if let Some(totals) = &totals {
+        println!(
+            "\n  Runs         {} completed ({} with file errors)",
+            count(totals.completed_runs),
+            count(totals.partial_runs)
+        );
+        println!(
+            "               {} failed · {} space pauses · {} interrupted",
+            count(totals.failed_runs),
+            count(totals.paused_runs),
+            count(totals.interrupted_runs)
+        );
+    }
+    // Prefer errors from the current run; retain the last report's errors while
+    // the next run is still discovering files or after a service restart.
+    let errors = progress
+        .as_ref()
+        .filter(|s| !s.errors.is_empty())
+        .or(result.as_ref());
+    if let Some(report) = errors.filter(|s| !s.errors.is_empty()) {
+        println!("\n  Recent file errors");
+        for error in report.errors.iter().take(10) {
+            println!("    {error}");
+        }
+        if report.errors.len() > 10 {
+            println!(
+                "    … {} more (use --json for the full list)",
+                count((report.errors.len() - 10) as u64)
+            );
         }
     }
-    println!("Deduped bytes are logical bytes accepted by the kernel, not measured physical savings. Totals cover completed runs recorded by this service.");
+    println!("\n  Logical bytes are not measured disk savings. Totals cover completed runs.");
     Ok(())
+}
+
+fn count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+    formatted
+}
+
+fn size(bytes: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.2} {}", UNITS[unit])
+}
+
+fn elapsed(seconds: u64) -> String {
+    if seconds >= 86400 {
+        format!("{}d {}h", seconds / 86400, seconds % 86400 / 3600)
+    } else if seconds >= 3600 {
+        format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
+    } else if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
