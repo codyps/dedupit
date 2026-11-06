@@ -93,6 +93,72 @@ struct Totals {
     bytes_already_shared: u64,
 }
 
+// Counters are updated by snapshot deltas, not whole-run additions. Persisting
+// them alongside the snapshot makes restart recovery idempotent.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Activity {
+    scans_started: u64,
+    files_seen: u64,
+    files_hashed: u64,
+    bytes_hashed: u64,
+    jobs_completed: u64,
+    bytes_deduped: u64,
+    bytes_already_shared: u64,
+}
+impl Activity {
+    fn observe(&mut self, before: &Stats, after: &Stats) {
+        self.files_seen += after.files_seen.saturating_sub(before.files_seen);
+        self.files_hashed += after.files_hashed.saturating_sub(before.files_hashed);
+        self.bytes_hashed += after.bytes_hashed.saturating_sub(before.bytes_hashed);
+        self.jobs_completed += after.jobs_completed.saturating_sub(before.jobs_completed);
+        self.bytes_deduped += after.bytes_deduped.saturating_sub(before.bytes_deduped);
+        self.bytes_already_shared += after
+            .bytes_already_shared
+            .saturating_sub(before.bytes_already_shared);
+    }
+}
+
+fn recover_activity(previous: Option<&serde_json::Value>) -> Result<Activity> {
+    let Some(previous) = previous else {
+        return Ok(Activity::default());
+    };
+    if let Some(activity) = previous.get("activity") {
+        return Ok(serde_json::from_value(activity.clone())?);
+    }
+    // Migrate the old completed-only totals and the last saved unfinished run.
+    let totals: Totals = previous
+        .get("totals")
+        .map(Totals::deserialize)
+        .transpose()?
+        .unwrap_or_default();
+    let mut activity = Activity {
+        scans_started: totals.completed_runs
+            + totals.failed_runs
+            + totals.interrupted_runs
+            + totals.paused_runs
+            + u64::from(previous["state"] == "running"),
+        files_hashed: totals.files_hashed,
+        bytes_hashed: totals.bytes_hashed,
+        jobs_completed: totals.jobs_completed,
+        bytes_deduped: totals.bytes_deduped,
+        bytes_already_shared: totals.bytes_already_shared,
+        ..Default::default()
+    };
+    let finished_successfully = matches!(
+        previous["state"].as_str(),
+        Some("completed" | "finished_with_errors")
+    ) || (previous["state"] == "stopped"
+        && previous["finished_at"].as_u64().is_some()
+        && previous["error"].is_null());
+    if !finished_successfully {
+        if let Some(progress) = previous.get("progress") {
+            activity.observe(&Stats::default(), &Stats::deserialize(progress)?);
+        }
+    }
+    Ok(activity)
+}
+
 #[derive(Serialize)]
 struct Status {
     state: &'static str,
@@ -104,6 +170,8 @@ struct Status {
     error: Option<String>,
     progress: Stats,
     totals: Totals,
+    activity: Activity,
+    phase: &'static str,
 }
 
 fn now() -> u64 {
@@ -184,7 +252,32 @@ impl Monitor {
         Ok(())
     }
 }
+impl Monitor {
+    fn record(&self, stats: &Stats) -> Result<()> {
+        {
+            let mut status = self.status.borrow_mut();
+            let previous = std::mem::replace(&mut status.progress, stats.clone());
+            status.activity.observe(&previous, stats);
+            status.updated_at = now();
+        }
+        self.write()?;
+        *self.reported.borrow_mut() = Instant::now();
+        Ok(())
+    }
+}
 impl RunObserver for Monitor {
+    fn phase(&self, phase: &'static str) -> Result<()> {
+        self.checkpoint()?;
+        {
+            let mut status = self.status.borrow_mut();
+            status.phase = phase;
+            status.updated_at = now();
+        }
+        self.write()
+    }
+    fn finished(&self, stats: &Stats) -> Result<()> {
+        self.record(stats)
+    }
     fn checkpoint(&self) -> Result<()> {
         if STOP.load(Ordering::Relaxed) {
             return Err(Paused::Signal.into());
@@ -197,13 +290,7 @@ impl RunObserver for Monitor {
     fn progress(&self, stats: &Stats) -> Result<()> {
         self.checkpoint()?;
         if self.reported.borrow().elapsed() >= Duration::from_secs(5) {
-            {
-                let mut status = self.status.borrow_mut();
-                status.progress = stats.clone();
-                status.updated_at = now();
-            }
-            self.write()?;
-            *self.reported.borrow_mut() = Instant::now();
+            self.record(stats)?;
         }
         Ok(())
     }
@@ -348,11 +435,21 @@ pub fn run(args: ServiceArgs) -> Result<()> {
     // Status and totals are one atomic document, so a crash cannot apply the
     // same completed run twice to cumulative totals. Legacy reports remain usable.
     let previous = read_optional::<serde_json::Value>(&directory.join("filesystem-status.json"))?;
-    let totals = previous
+    let activity = recover_activity(previous.as_ref())?;
+    let mut totals: Totals = previous
+        .as_ref()
         .and_then(|v| v.get("totals").cloned())
         .map(serde_json::from_value)
         .transpose()?
         .unwrap_or_default();
+    if previous
+        .as_ref()
+        .is_some_and(|s| s["state"] == "running" && s["finished_at"].is_null())
+    {
+        // The last daemon did not finish or stop gracefully. Its saved activity
+        // is already included; count the abandoned scan without adding it again.
+        totals.interrupted_runs += 1;
+    }
     let monitor = Rc::new(Monitor {
         directory,
         minimum: args.minimum_free_bytes,
@@ -366,6 +463,8 @@ pub fn run(args: ServiceArgs) -> Result<()> {
             error: None,
             progress: Stats::default(),
             totals,
+            activity,
+            phase: "Starting",
         }),
         checked: RefCell::new(Instant::now()),
         reported: RefCell::new(Instant::now()),
@@ -374,6 +473,8 @@ pub fn run(args: ServiceArgs) -> Result<()> {
         {
             let mut status = monitor.status.borrow_mut();
             status.state = "running";
+            status.activity.scans_started += 1;
+            status.phase = "Checking free space";
             status.started_at = now();
             status.updated_at = now();
             status.finished_at = None;
@@ -511,6 +612,7 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         );
         return Ok(());
     }
+    let activity = recover_activity(status.as_ref())?;
     let progress = status
         .as_ref()
         .and_then(|s| s.get("progress"))
@@ -535,6 +637,11 @@ pub fn stats(args: StatsArgs) -> Result<()> {
             _ => "Unknown",
         };
         println!("  Status       {state}");
+        if status["state"] == "running" {
+            if let Some(phase) = status["phase"].as_str() {
+                println!("  Phase        {phase}");
+            }
+        }
         let current_time = now();
         if let Some(updated) = status["updated_at"].as_u64() {
             println!(
@@ -567,7 +674,7 @@ pub fn stats(args: StatsArgs) -> Result<()> {
     println!();
     println!(
         "  {:<22} {:>17} {:>17} {:>17}",
-        "", "Current/latest", "Last complete", "All completed"
+        "", "This scan", "Last complete", "All recorded"
     );
     let row = |label: &str, a: Option<u64>, b: Option<u64>, c: Option<u64>, bytes: bool| {
         let value = |n: Option<u64>| {
@@ -585,54 +692,64 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         "Files scanned",
         progress.as_ref().map(|s| s.files_seen),
         result.as_ref().map(|s| s.files_seen),
-        None,
+        Some(activity.files_seen),
         false,
     );
     row(
         "Files hashed",
         progress.as_ref().map(|s| s.files_hashed),
         result.as_ref().map(|s| s.files_hashed),
-        totals.as_ref().map(|s| s.files_hashed),
+        Some(activity.files_hashed),
         false,
     );
     row(
         "Data read",
         progress.as_ref().map(|s| s.bytes_hashed),
         result.as_ref().map(|s| s.bytes_hashed),
-        totals.as_ref().map(|s| s.bytes_hashed),
+        Some(activity.bytes_hashed),
         true,
     );
     row(
         "Deduped (logical)",
         progress.as_ref().map(|s| s.bytes_deduped),
         result.as_ref().map(|s| s.bytes_deduped),
-        totals.as_ref().map(|s| s.bytes_deduped),
+        Some(activity.bytes_deduped),
         true,
     );
     row(
         "Already shared",
         progress.as_ref().map(|s| s.bytes_already_shared),
         result.as_ref().map(|s| s.bytes_already_shared),
-        totals.as_ref().map(|s| s.bytes_already_shared),
+        Some(activity.bytes_already_shared),
         true,
     );
     row(
         "Sharing jobs",
         progress.as_ref().map(|s| s.jobs_completed),
         result.as_ref().map(|s| s.jobs_completed),
-        totals.as_ref().map(|s| s.jobs_completed),
+        Some(activity.jobs_completed),
         false,
     );
+    // Duplicate group counts are summarized only after scanning finishes.
+    let summarized = status
+        .as_ref()
+        .is_some_and(|s| s["finished_at"].as_u64().is_some());
     row(
         "Duplicate files",
-        progress.as_ref().map(|s| s.duplicate_files),
+        progress
+            .as_ref()
+            .filter(|_| summarized)
+            .map(|s| s.duplicate_files),
         result.as_ref().map(|s| s.duplicate_files),
         None,
         false,
     );
     row(
         "Duplicate chunks",
-        progress.as_ref().map(|s| s.duplicate_chunks),
+        progress
+            .as_ref()
+            .filter(|_| summarized)
+            .map(|s| s.duplicate_chunks),
         result.as_ref().map(|s| s.duplicate_chunks),
         None,
         false,
@@ -646,7 +763,8 @@ pub fn stats(args: StatsArgs) -> Result<()> {
     );
     if let Some(totals) = &totals {
         println!(
-            "\n  Runs         {} completed ({} with file errors)",
+            "\n  Scans        {} started · {} completed ({} with file errors)",
+            count(activity.scans_started),
             count(totals.completed_runs),
             count(totals.partial_runs)
         );
@@ -675,7 +793,7 @@ pub fn stats(args: StatsArgs) -> Result<()> {
             );
         }
     }
-    println!("\n  Logical bytes are not measured disk savings. Totals cover completed runs.");
+    println!("\n  All recorded includes live and interrupted work. Duplicate counts await scan completion.\n  Logical bytes are not measured disk savings.");
     Ok(())
 }
 
@@ -714,5 +832,55 @@ fn elapsed(seconds: u64) -> String {
         format!("{}m {}s", seconds / 60, seconds % 60)
     } else {
         format!("{seconds}s")
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn live_totals_use_deltas_and_retain_interrupted_scans() {
+        let mut activity = Activity::default();
+        let first = Stats {
+            files_seen: 10,
+            bytes_hashed: 4096,
+            bytes_deduped: 1024,
+            ..Default::default()
+        };
+        activity.observe(&Stats::default(), &first);
+        activity.observe(&first, &first); // Reporting the same snapshot is idempotent.
+        let last = Stats {
+            files_seen: 20,
+            bytes_hashed: 8192,
+            bytes_deduped: 2048,
+            ..Default::default()
+        };
+        activity.observe(&first, &last);
+        let persisted = serde_json::json!({"activity": activity});
+        let mut restarted = recover_activity(Some(&persisted)).unwrap();
+        restarted.observe(&Stats::default(), &first); // A new scan starts from zero.
+        assert_eq!(restarted.files_seen, 30);
+        assert_eq!(restarted.bytes_hashed, 12288);
+        assert_eq!(restarted.bytes_deduped, 3072);
+    }
+
+    #[test]
+    fn migration_adds_unfinished_work_but_never_recounts_completed_work() {
+        let base = serde_json::json!({"state":"stopped", "finished_at":123, "error":null,
+            "totals":{"completed_runs":1,"bytes_hashed":8192}, "progress":{"bytes_hashed":8192}});
+        assert_eq!(recover_activity(Some(&base)).unwrap().bytes_hashed, 8192);
+        let mut interrupted = base.clone();
+        interrupted["error"] = serde_json::json!("stop requested");
+        interrupted["progress"]["bytes_hashed"] = serde_json::json!(4096);
+        assert_eq!(
+            recover_activity(Some(&interrupted)).unwrap().bytes_hashed,
+            12288
+        );
+        interrupted["state"] = serde_json::json!("running");
+        assert_eq!(
+            recover_activity(Some(&interrupted)).unwrap().scans_started,
+            2
+        );
     }
 }

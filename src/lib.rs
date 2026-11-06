@@ -109,6 +109,14 @@ pub fn list_duplicates(
 /// Cooperative service control. Errors abort the current batch, leaving committed
 /// progress reusable. Callbacks run on the scanning thread; they must not block.
 pub trait RunObserver {
+    fn phase(&self, _phase: &'static str) -> Result<()> {
+        self.checkpoint()
+    }
+    /// Final counters on success or failure. This must be allowed even after
+    /// cancellation so the last observed work can be recorded before exit.
+    fn finished(&self, _stats: &Stats) -> Result<()> {
+        Ok(())
+    }
     fn checkpoint(&self) -> Result<()>;
     fn progress(&self, _stats: &Stats) -> Result<()> {
         self.checkpoint()
@@ -158,16 +166,34 @@ fn run_inner(
         (1..=4096).contains(&options.commit_batch_size),
         "commit batch size must be between 1 and 4096"
     );
-    let mut index = index::Index::open(options)?;
-    index.observer = observer;
     let mut stats = Stats::default();
-    let mut sharing = index::Interleaver::new(if apply { Some(backend) } else { None });
-    scan::scan(&mut index, options, &mut stats, &mut sharing).context("scanning files")?;
-    index.flush_batch()?;
-    index.summarize(&mut stats)?;
-    sharing.finish(&mut index, &mut stats)?;
-    index.flush_batch()?;
-    stats.database_batches = index.batch_commits();
-    index.progress(&stats)?;
+    let outcome = (|| -> Result<()> {
+        if let Some(observer) = &observer {
+            observer.phase("Opening index")?;
+        }
+        let mut index = index::Index::open(options)?;
+        index.observer = observer.clone();
+        let mut sharing = index::Interleaver::new(if apply { Some(backend) } else { None });
+        if let Some(observer) = &observer {
+            observer.phase("Scanning files")?;
+        }
+        scan::scan(&mut index, options, &mut stats, &mut sharing).context("scanning files")?;
+        index.flush_batch()?;
+        if let Some(observer) = &observer {
+            observer.phase("Summarizing duplicates")?;
+        }
+        index.summarize(&mut stats)?;
+        if let Some(observer) = &observer {
+            observer.phase("Sharing remaining ranges")?;
+        }
+        sharing.finish(&mut index, &mut stats)?;
+        index.flush_batch()?;
+        stats.database_batches = index.batch_commits();
+        Ok(())
+    })();
+    if let Some(observer) = &observer {
+        observer.finished(&stats)?;
+    }
+    outcome?;
     Ok(stats)
 }

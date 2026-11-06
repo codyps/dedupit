@@ -799,3 +799,35 @@ fn cooperative_stop_during_large_file_rolls_back_and_can_resume() {
     assert_eq!(resumed.bytes_hashed, 65536);
     assert_eq!(run(&options, false).unwrap().bytes_hashed, 0);
 }
+
+#[test]
+fn final_progress_is_reported_even_when_observer_cancels_the_run() {
+    use dedupit::RunObserver;
+    use std::{cell::Cell, rc::Rc};
+    #[derive(Default)]
+    struct Observe {
+        stop: Cell<bool>,
+        final_bytes: Cell<u64>,
+    }
+    impl RunObserver for Observe {
+        fn checkpoint(&self) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.stop.get(), "cancelled by test");
+            Ok(())
+        }
+        fn progress(&self, stats: &dedupit::Stats) -> anyhow::Result<()> {
+            if stats.bytes_hashed >= 4096 {
+                self.stop.set(true);
+            }
+            self.checkpoint()
+        }
+        fn finished(&self, stats: &dedupit::Stats) -> anyhow::Result<()> {
+            self.final_bytes.set(stats.bytes_hashed);
+            Ok(())
+        }
+    }
+    let (_dir, options) = setup(Granularity::Both);
+    put(&options, "a", &vec![1; 65536]);
+    let observer = Rc::new(Observe::default());
+    assert!(dedupit::run_observed(&options, false, observer.clone()).is_err());
+    assert!(observer.final_bytes.get() >= 4096);
+}

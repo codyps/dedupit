@@ -97,6 +97,12 @@ fn service_repeats_records_statistics_and_resumes_index_and_totals_after_sigterm
     });
     assert_eq!(after["progress"]["files_hashed"], 0);
     assert_eq!(after["totals"]["files_hashed"], 3);
+    assert_eq!(after["activity"]["files_hashed"], 3);
+    assert_eq!(after["activity"]["bytes_hashed"], 20480);
+    assert!(
+        after["activity"]["scans_started"].as_u64().unwrap()
+            > before["activity"]["scans_started"].as_u64().unwrap()
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_dedupit"))
         .args(["stats", "--json", "--state-directory"])
         .arg(&state)
@@ -114,7 +120,7 @@ fn service_repeats_records_statistics_and_resumes_index_and_totals_after_sigterm
     assert!(human.status.success());
     assert!(String::from_utf8(human.stdout)
         .unwrap()
-        .contains("All completed"));
+        .contains("All recorded"));
     restarted.stop();
 }
 

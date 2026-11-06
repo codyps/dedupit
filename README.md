@@ -104,15 +104,26 @@ Reports are private files in `--state-directory` (default `/var/lib/dedupit`):
 - `filesystem-result.json`: last complete run's statistics, including file errors.
   An interrupted or paused run does not replace it.
 
-Cumulative byte/file/job counters cover completed runs recorded by the native
-service, including runs with per-file errors. Separate counters track partial,
-failed, paused, and interrupted runs. Earlier one-shot reports remain readable;
-new cumulative totals start when the native service is first used.
+The `All recorded` column includes live work and interrupted scans. Snapshot
+deltas are persisted with the current scan, so restarting retains previously
+recorded activity without counting a snapshot twice. A final snapshot is saved
+on graceful cancellation or scan failure; a forced kill can lose work since the
+last snapshot. JSON exposes these counters as `status.activity`; the older
+`status.totals` counters retain their completed-run meaning. Separate counters
+track completed, partial, failed, paused, and interrupted scans.
+
+The service records its phase, including opening the index, scanning, summarizing,
+and sharing. Duplicate-group counts are only available after summarization and
+show `-` while the scan is unfinished. The number of scans started is shown even
+before the first scan completes. Migration retains old completed counters and
+any saved unfinished snapshot; work lost by older versions cannot be recovered.
+Earlier one-shot reports remain readable.
 Human-readable output groups counts, uses binary size units and compact elapsed
 times, and compares current, last-complete, and cumulative counters in columns.
 `stats` also reads the live database footprint (DB + WAL + SHM file sizes); JSON
 includes this as `database` with byte counts, or `null` before index creation.
-File sizes are sampled separately and can change while the service is running. Bytes deduped
+File sizes are sampled separately and can change while the service is running.
+Bytes deduped
 are **logical bytes accepted by the kernel**, not measured physical savings.
 A crash or forced kill can leave the latest status stale; `stats` shows its age.
 Reports use atomic replacement. Fatal scan failures and busy files are logged
@@ -123,6 +134,11 @@ Cancellation checkpoints run between metadata pages, files, hash chunks, and
 sharing ioctls. Stopping rolls back the active SQLite batch; committed progress
 remains reusable. A kernel operation or database migration can delay stopping;
 a service manager may still impose a stop timeout.
+
+On hardlink-heavy trees, Btrfs inode-to-path lookup can exceed the kernel's
+4 KiB response limit. Dedupit falls back to paginated inode references and
+resolves the parent directories, preserving all aliases and scan-root scoping.
+This limit does not require a portable scan or indicate filesystem corruption.
 
 ## Nix and NixOS
 
