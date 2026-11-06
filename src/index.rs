@@ -801,7 +801,7 @@ impl Index {
             while done < target.len {
                 self.progress(stats)?;
                 let len = (target.len - done).min(16 * 1024 * 1024);
-                let result = backend.dedupe(
+                let measured = backend.dedupe_with_savings(
                     &source_file,
                     &destination,
                     Range {
@@ -810,6 +810,13 @@ impl Index {
                     },
                     target.offset + done,
                 );
+                let mut saved = 0;
+                let mut measured_bytes = 0;
+                let result = measured.map(|report| {
+                    saved = report.estimated_bytes_saved;
+                    measured_bytes = report.savings_measured_bytes;
+                    report.outcome
+                });
                 match result {
                     Ok(Outcome::Shared(bytes) | Outcome::AlreadyShared(bytes))
                         if bytes > 0
@@ -818,6 +825,8 @@ impl Index {
                     {
                         if matches!(result, Ok(Outcome::Shared(_))) {
                             stats.bytes_deduped += bytes;
+                            stats.estimated_bytes_saved += saved;
+                            stats.savings_measured_bytes += measured_bytes.min(bytes);
                             mapping_changed = true;
                         } else {
                             stats.bytes_already_shared += bytes;

@@ -91,6 +91,8 @@ struct Totals {
     jobs_completed: u64,
     bytes_deduped: u64,
     bytes_already_shared: u64,
+    estimated_bytes_saved: u64,
+    savings_measured_bytes: u64,
 }
 
 // Counters are updated by snapshot deltas, not whole-run additions. Persisting
@@ -105,9 +107,17 @@ struct Activity {
     jobs_completed: u64,
     bytes_deduped: u64,
     bytes_already_shared: u64,
+    estimated_bytes_saved: u64,
+    savings_measured_bytes: u64,
 }
 impl Activity {
     fn observe(&mut self, before: &Stats, after: &Stats) {
+        self.estimated_bytes_saved += after
+            .estimated_bytes_saved
+            .saturating_sub(before.estimated_bytes_saved);
+        self.savings_measured_bytes += after
+            .savings_measured_bytes
+            .saturating_sub(before.savings_measured_bytes);
         self.files_seen += after.files_seen.saturating_sub(before.files_seen);
         self.files_hashed += after.files_hashed.saturating_sub(before.files_hashed);
         self.bytes_hashed += after.bytes_hashed.saturating_sub(before.bytes_hashed);
@@ -143,6 +153,8 @@ fn recover_activity(previous: Option<&serde_json::Value>) -> Result<Activity> {
         jobs_completed: totals.jobs_completed,
         bytes_deduped: totals.bytes_deduped,
         bytes_already_shared: totals.bytes_already_shared,
+        estimated_bytes_saved: totals.estimated_bytes_saved,
+        savings_measured_bytes: totals.savings_measured_bytes,
         ..Default::default()
     };
     let finished_successfully = matches!(
@@ -505,6 +517,8 @@ pub fn run(args: ServiceArgs) -> Result<()> {
                     status.totals.jobs_completed += stats.jobs_completed;
                     status.totals.bytes_deduped += stats.bytes_deduped;
                     status.totals.bytes_already_shared += stats.bytes_already_shared;
+                    status.totals.estimated_bytes_saved += stats.estimated_bytes_saved;
+                    status.totals.savings_measured_bytes += stats.savings_measured_bytes;
                     status.progress = stats;
                 }
                 Err(error) => {
@@ -716,6 +730,53 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         Some(activity.bytes_deduped),
         true,
     );
+    let estimate = |deduped: u64, measured: u64, saved: u64| {
+        if deduped > 0 && measured == 0 {
+            "Unknown".to_string()
+        } else {
+            size(saved)
+        }
+    };
+    println!(
+        "  {:<22} {:>17} {:>17} {:>17}",
+        "Est. space saved",
+        progress
+            .as_ref()
+            .map(|s| estimate(
+                s.bytes_deduped,
+                s.savings_measured_bytes,
+                s.estimated_bytes_saved
+            ))
+            .unwrap_or_else(|| "-".into()),
+        result
+            .as_ref()
+            .map(|s| estimate(
+                s.bytes_deduped,
+                s.savings_measured_bytes,
+                s.estimated_bytes_saved
+            ))
+            .unwrap_or_else(|| "-".into()),
+        estimate(
+            activity.bytes_deduped,
+            activity.savings_measured_bytes,
+            activity.estimated_bytes_saved
+        )
+    );
+    row(
+        "Unmeasured dedupe",
+        progress
+            .as_ref()
+            .map(|s| s.bytes_deduped.saturating_sub(s.savings_measured_bytes)),
+        result
+            .as_ref()
+            .map(|s| s.bytes_deduped.saturating_sub(s.savings_measured_bytes)),
+        Some(
+            activity
+                .bytes_deduped
+                .saturating_sub(activity.savings_measured_bytes),
+        ),
+        true,
+    );
     row(
         "Already shared",
         progress.as_ref().map(|s| s.bytes_already_shared),
@@ -793,7 +854,7 @@ pub fn stats(args: StatsArgs) -> Result<()> {
             );
         }
     }
-    println!("\n  All recorded includes live and interrupted work. Duplicate counts await scan completion.\n  Logical bytes are not measured disk savings.");
+    println!("\n  Estimated savings count fully replaced, previously unshared Btrfs allocations,\n  including compression. Unmeasured work is excluded; metadata/replication and\n  concurrent changes are not accounted for. This is cumulative, not net free space.\n  All recorded includes live and interrupted work; duplicate counts await completion.");
     Ok(())
 }
 
@@ -846,6 +907,8 @@ mod progress_tests {
             files_seen: 10,
             bytes_hashed: 4096,
             bytes_deduped: 1024,
+            estimated_bytes_saved: 512,
+            savings_measured_bytes: 1024,
             ..Default::default()
         };
         activity.observe(&Stats::default(), &first);
@@ -854,6 +917,8 @@ mod progress_tests {
             files_seen: 20,
             bytes_hashed: 8192,
             bytes_deduped: 2048,
+            estimated_bytes_saved: 1024,
+            savings_measured_bytes: 2048,
             ..Default::default()
         };
         activity.observe(&first, &last);
@@ -863,6 +928,8 @@ mod progress_tests {
         assert_eq!(restarted.files_seen, 30);
         assert_eq!(restarted.bytes_hashed, 12288);
         assert_eq!(restarted.bytes_deduped, 3072);
+        assert_eq!(restarted.estimated_bytes_saved, 1536);
+        assert_eq!(restarted.savings_measured_bytes, 3072);
     }
 
     #[test]

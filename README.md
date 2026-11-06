@@ -125,6 +125,21 @@ includes this as `database` with byte counts, or `null` before index creation.
 File sizes are sampled separately and can change while the service is running.
 Bytes deduped
 are **logical bytes accepted by the kernel**, not measured physical savings.
+`Est. space saved` is a conservative estimate of cumulative Btrfs physical data
+allocations replaced by successful deduplication. The estimator compares FIEMAP
+before and after sharing, requires previously unshared complete allocations,
+and reads the file-extent allocation size (including compression) and reference
+count. Shared allocations, holes, and already-shared data are assigned zero;
+partial or uncertain mappings remain unmeasured. Estimation failures do not
+prevent deduplication. `Unmeasured dedupe` reports successful logical bytes not
+covered by the estimate, including all work done before this feature existed.
+With no coverage the estimate displays `Unknown`, rather than a fabricated zero.
+JSON records `estimated_bytes_saved` and `savings_measured_bytes` in scan reports,
+completed totals, and live activity. The estimate excludes metadata and RAID
+replication and can differ from current free space due to snapshots, concurrent
+writes, later modifications/deletion, and deferred Btrfs transaction processing.
+It is a gross estimate of recorded work, not a measurement of net free space.
+
 A crash or forced kill can leave the latest status stale; `stats` shows its age.
 Reports use atomic replacement. Fatal scan failures and busy files are logged
 and retried at the next interval. A failure to persist reports exits the service.

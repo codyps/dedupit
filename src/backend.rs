@@ -17,7 +17,29 @@ pub enum Outcome {
     Unsupported,
 }
 
+pub struct DedupeReport {
+    pub outcome: Outcome,
+    pub estimated_bytes_saved: u64,
+    pub savings_measured_bytes: u64,
+}
+
 pub trait Backend {
+    /// Optional physical savings attribution. Unknown is zero coverage, not a
+    /// claim that successful sharing saved zero physical bytes.
+    fn dedupe_with_savings(
+        &mut self,
+        source: &File,
+        destination: &File,
+        range: Range,
+        destination_offset: u64,
+    ) -> io::Result<DedupeReport> {
+        Ok(DedupeReport {
+            outcome: self.dedupe(source, destination, range, destination_offset)?,
+            estimated_bytes_saved: 0,
+            savings_measured_bytes: 0,
+        })
+    }
+
     /// Implementors must preserve bytes and independent write semantics,
     /// including in the presence of concurrent writes and hash collisions.
     fn dedupe(
@@ -32,6 +54,41 @@ pub trait Backend {
 pub struct NativeBackend;
 
 impl Backend for NativeBackend {
+    fn dedupe_with_savings(
+        &mut self,
+        source: &File,
+        destination: &File,
+        range: Range,
+        destination_offset: u64,
+    ) -> io::Result<DedupeReport> {
+        #[cfg(target_os = "linux")]
+        let snapshot = crate::savings::Snapshot::capture(
+            destination,
+            Range {
+                offset: destination_offset,
+                len: range.len,
+            },
+        );
+        let outcome = self.dedupe(source, destination, range, destination_offset)?;
+        #[cfg(target_os = "linux")]
+        if let Outcome::Shared(bytes) = outcome {
+            if let Some((estimated_bytes_saved, savings_measured_bytes)) =
+                snapshot.and_then(|s| s.finish(destination, bytes))
+            {
+                return Ok(DedupeReport {
+                    outcome,
+                    estimated_bytes_saved,
+                    savings_measured_bytes,
+                });
+            }
+        }
+        Ok(DedupeReport {
+            outcome,
+            estimated_bytes_saved: 0,
+            savings_measured_bytes: 0,
+        })
+    }
+
     fn dedupe(
         &mut self,
         source: &File,

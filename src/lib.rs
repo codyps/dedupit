@@ -11,13 +11,15 @@ mod btrfs_scan;
 #[cfg(feature = "test-failpoints")]
 mod failpoints;
 mod index;
+#[cfg(target_os = "linux")]
+mod savings;
 mod scan;
 
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use std::{path::PathBuf, rc::Rc};
 
-pub use backend::{Backend, NativeBackend, Outcome, Range};
+pub use backend::{Backend, DedupeReport, NativeBackend, Outcome, Range};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Granularity {
@@ -80,6 +82,10 @@ pub struct Stats {
     /// Logical bytes accepted by the kernel, NOT measured physical savings.
     pub bytes_deduped: u64,
     pub bytes_already_shared: u64,
+    /// Conservative estimate of physical data allocations released by sharing.
+    pub estimated_bytes_saved: u64,
+    /// Logical bytes of successful sharing covered by physical estimation.
+    pub savings_measured_bytes: u64,
     pub unsupported: u64,
     pub stale: u64,
     pub errors: Vec<String>,

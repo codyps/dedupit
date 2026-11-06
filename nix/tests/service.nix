@@ -41,6 +41,8 @@ pkgs.testers.runNixOSTest {
     assert report["status"]["totals"]["bytes_deduped"] >= 2 * 1024 * 1024, report
     assert report["last_result"]["btrfs_subvolumes"] >= 3, report
     assert report["last_result"]["errors"] == [], report
+    assert report["status"]["activity"]["estimated_bytes_saved"] >= 2 * 1024 * 1024, report
+    assert report["status"]["activity"]["savings_measured_bytes"] > 0, report
     machine.fail("mountpoint /run/dedupit/filesystem")
     machine.succeed("cmp /mnt/fixture/one/a /mnt/fixture/two/b")
     machine.succeed("systemctl stop dedupit.service")
@@ -52,5 +54,26 @@ pkgs.testers.runNixOSTest {
     assert report["status"]["totals"]["completed_runs"] > previous, report
     assert report["last_result"]["bytes_hashed"] == 0, report
     machine.succeed("systemctl stop dedupit.service")
+    # Compressed copies should report encoded allocation sizes, not their
+    # much larger logical lengths. Run outside the service's periodic loop.
+    machine.succeed("mkdir /mnt/fixture/compressed")
+    machine.succeed("btrfs property set /mnt/fixture/compressed compression zstd")
+    machine.succeed("head -c 4194304 /dev/zero | base64 > /mnt/fixture/compressed/a")
+    machine.succeed("cp --reflink=never /mnt/fixture/compressed/a /mnt/fixture/compressed/b && sync")
+    compressed = json.loads(machine.succeed("dedupit --database /tmp/compressed.sqlite --scanner btrfs --granularity file --apply --json /mnt/fixture/compressed"))
+    assert compressed["errors"] == [], compressed
+    assert 0 < compressed["estimated_bytes_saved"] < compressed["bytes_deduped"] // 2, compressed
+    assert compressed["savings_measured_bytes"] > 0, compressed
+    # An external reflink retains the destination's old allocation, so sharing
+    # that destination must not be attributed as reclaimed physical space.
+    machine.succeed("mkdir -p /mnt/fixture/held/data")
+    machine.succeed("dd if=/dev/urandom of=/mnt/fixture/held/data/a bs=1M count=1 status=none")
+    machine.succeed("cp --reflink=never /mnt/fixture/held/data/a /mnt/fixture/held/data/b")
+    machine.succeed("cp --reflink=always /mnt/fixture/held/data/b /mnt/fixture/held/keep && sync")
+    held = json.loads(machine.succeed("dedupit --database /tmp/held.sqlite --scanner btrfs --granularity file --apply --json /mnt/fixture/held/data"))
+    assert held["errors"] == [], held
+    assert held["bytes_deduped"] > 0, held
+    assert held["estimated_bytes_saved"] == 0, held
+    assert held["savings_measured_bytes"] > 0, held
   '';
 }

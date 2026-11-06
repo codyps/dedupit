@@ -831,3 +831,44 @@ fn final_progress_is_reported_even_when_observer_cancels_the_run() {
     assert!(dedupit::run_observed(&options, false, observer.clone()).is_err());
     assert!(observer.final_bytes.get() >= 4096);
 }
+
+#[test]
+fn savings_attribution_counts_successful_sharing_once() {
+    struct Measured(ComparingBackend);
+    impl Backend for Measured {
+        fn dedupe(
+            &mut self,
+            source: &File,
+            dest: &File,
+            range: Range,
+            offset: u64,
+        ) -> io::Result<Outcome> {
+            self.0.dedupe(source, dest, range, offset)
+        }
+        fn dedupe_with_savings(
+            &mut self,
+            source: &File,
+            dest: &File,
+            range: Range,
+            offset: u64,
+        ) -> io::Result<dedupit::DedupeReport> {
+            let outcome = self.dedupe(source, dest, range, offset)?;
+            Ok(dedupit::DedupeReport {
+                outcome,
+                estimated_bytes_saved: range.len / 2,
+                savings_measured_bytes: range.len,
+            })
+        }
+    }
+    let (_dir, options) = setup(Granularity::Both);
+    put(&options, "a", &vec![42; 8192]);
+    put(&options, "b", &vec![42; 8192]);
+    let mut backend = Measured(ComparingBackend::default());
+    let first = run_with_backend(&options, true, &mut backend).unwrap();
+    assert!(first.bytes_deduped > 0);
+    assert_eq!(first.estimated_bytes_saved, first.bytes_deduped / 2);
+    assert_eq!(first.savings_measured_bytes, first.bytes_deduped);
+    let resumed = run_with_backend(&options, true, &mut backend).unwrap();
+    assert_eq!(resumed.estimated_bytes_saved, 0);
+    assert_eq!(resumed.savings_measured_bytes, 0);
+}
