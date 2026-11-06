@@ -724,59 +724,74 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         true,
     );
     row(
-        "Deduped (logical)",
+        "Saved (uncompressed)",
         progress.as_ref().map(|s| s.bytes_deduped),
         result.as_ref().map(|s| s.bytes_deduped),
         Some(activity.bytes_deduped),
         true,
     );
-    let estimate = |deduped: u64, measured: u64, saved: u64| {
-        if deduped > 0 && measured == 0 {
-            "Unknown".to_string()
+    let physical = |stats: &Stats| {
+        if stats.savings_measured_bytes > 0 {
+            size(stats.estimated_bytes_saved)
         } else {
-            size(saved)
+            "-".into()
         }
     };
-    println!(
-        "  {:<22} {:>17} {:>17} {:>17}",
-        "Est. space saved",
-        progress
+    if activity.savings_measured_bytes > 0
+        || progress
             .as_ref()
-            .map(|s| estimate(
-                s.bytes_deduped,
-                s.savings_measured_bytes,
-                s.estimated_bytes_saved
-            ))
-            .unwrap_or_else(|| "-".into()),
-        result
+            .is_some_and(|s| s.savings_measured_bytes > 0)
+        || result
             .as_ref()
-            .map(|s| estimate(
-                s.bytes_deduped,
-                s.savings_measured_bytes,
-                s.estimated_bytes_saved
-            ))
-            .unwrap_or_else(|| "-".into()),
-        estimate(
-            activity.bytes_deduped,
-            activity.savings_measured_bytes,
-            activity.estimated_bytes_saved
-        )
-    );
+            .is_some_and(|s| s.savings_measured_bytes > 0)
+    {
+        println!(
+            "  {:<22} {:>17} {:>17} {:>17}",
+            "Physical estimate",
+            progress
+                .as_ref()
+                .map(physical)
+                .unwrap_or_else(|| "-".into()),
+            result.as_ref().map(physical).unwrap_or_else(|| "-".into()),
+            if activity.savings_measured_bytes > 0 {
+                size(activity.estimated_bytes_saved)
+            } else {
+                "-".into()
+            }
+        );
+    }
     row(
-        "Unmeasured dedupe",
-        progress
-            .as_ref()
-            .map(|s| s.bytes_deduped.saturating_sub(s.savings_measured_bytes)),
-        result
-            .as_ref()
-            .map(|s| s.bytes_deduped.saturating_sub(s.savings_measured_bytes)),
-        Some(
-            activity
-                .bytes_deduped
-                .saturating_sub(activity.savings_measured_bytes),
-        ),
+        "Estimate scanned",
+        progress.as_ref().map(|s| s.savings_measured_bytes),
+        result.as_ref().map(|s| s.savings_measured_bytes),
+        Some(activity.savings_measured_bytes),
         true,
     );
+    if activity.savings_measured_bytes > 0 {
+        let coverage = |bytes: u64, measured: u64| {
+            if bytes == 0 {
+                "-".to_string()
+            } else {
+                format!(
+                    "{:.1}%",
+                    (measured.min(bytes) as f64) / bytes as f64 * 100.0
+                )
+            }
+        };
+        println!(
+            "  {:<22} {:>17} {:>17} {:>17}",
+            "Physical coverage",
+            progress
+                .as_ref()
+                .map(|s| coverage(s.bytes_deduped, s.savings_measured_bytes))
+                .unwrap_or_else(|| "-".into()),
+            result
+                .as_ref()
+                .map(|s| coverage(s.bytes_deduped, s.savings_measured_bytes))
+                .unwrap_or_else(|| "-".into()),
+            coverage(activity.bytes_deduped, activity.savings_measured_bytes)
+        );
+    }
     row(
         "Already shared",
         progress.as_ref().map(|s| s.bytes_already_shared),
@@ -854,7 +869,7 @@ pub fn stats(args: StatsArgs) -> Result<()> {
             );
         }
     }
-    println!("\n  Estimated savings count fully replaced, previously unshared Btrfs allocations,\n  including compression. Unmeasured work is excluded; metadata/replication and\n  concurrent changes are not accounted for. This is cumulative, not net free space.\n  All recorded includes live and interrupted work; duplicate counts await completion.");
+
     Ok(())
 }
 

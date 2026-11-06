@@ -125,15 +125,21 @@ includes this as `database` with byte counts, or `null` before index creation.
 File sizes are sampled separately and can change while the service is running.
 Bytes deduped
 are **logical bytes accepted by the kernel**, not measured physical savings.
-`Est. space saved` is a conservative estimate of cumulative Btrfs physical data
+`Saved (uncompressed)` always shows the recorded logical bytes deduplicated,
+including earlier work for which no physical measurement exists.
+`Physical estimate` is shown when physical measurements are available; it
+is a conservative estimate of cumulative Btrfs physical data
 allocations replaced by successful deduplication. The estimator compares FIEMAP
 before and after sharing, requires previously unshared complete allocations,
 and reads the file-extent allocation size (including compression) and reference
 count. Shared allocations, holes, and already-shared data are assigned zero;
 partial or uncertain mappings remain unmeasured. Estimation failures do not
-prevent deduplication. `Unmeasured dedupe` reports successful logical bytes not
-covered by the estimate, including all work done before this feature existed.
-With no coverage the estimate displays `Unknown`, rather than a fabricated zero.
+prevent deduplication. Physical measurement gaps never hide the uncompressed
+savings. The optional physical row uses `-` for columns without measurements.
+`Estimate scanned` always shows the logical byte count examined for the physical
+estimate; `Physical coverage` also shows its share of each logical total.
+JSON retains coverage counters for identifying unmeasured logical bytes, including
+work done before physical estimation was introduced.
 JSON records `estimated_bytes_saved` and `savings_measured_bytes` in scan reports,
 completed totals, and live activity. The estimate excludes metadata and RAID
 replication and can differ from current free space due to snapshots, concurrent
