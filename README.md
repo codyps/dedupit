@@ -159,6 +159,15 @@ sharing ioctls. Stopping rolls back the active SQLite batch; committed progress
 remains reusable. A kernel operation or database migration can delay stopping;
 a service manager may still impose a stop timeout.
 
+Btrfs forbids sharing between checksummed and non-checksummed files. Native
+scanning records each file's checksum policy, and candidate selection partitions
+matches by that policy. Existing indexes learn missing policies without rehashing
+file contents. Compatible representatives are cached per content group and policy,
+so a large incompatible prefix is not retried for every destination. Such ranges
+appear as `Incompatible ranges`, not repeated `EINVAL` file errors. File COW and
+checksum flags are preserved. Unknown policies still defer to the kernel, and
+unexpected ioctl errors remain visible.
+
 On hardlink-heavy trees, Btrfs inode-to-path lookup can exceed the kernel's
 4 KiB response limit. Dedupit falls back to paginated inode references and
 resolves the parent directories, preserving all aliases and scan-root scoping.

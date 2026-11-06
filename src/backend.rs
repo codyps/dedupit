@@ -24,6 +24,12 @@ pub struct DedupeReport {
 }
 
 pub trait Backend {
+    /// Files with different known policy classes cannot share extents. Unknown
+    /// leaves the kernel authoritative, including for unprivileged callers.
+    fn sharing_policy(&mut self, _file: &File) -> io::Result<Option<u64>> {
+        Ok(None)
+    }
+
     /// Optional physical savings attribution. Unknown is zero coverage, not a
     /// claim that successful sharing saved zero physical bytes.
     fn dedupe_with_savings(
@@ -54,6 +60,27 @@ pub trait Backend {
 pub struct NativeBackend;
 
 impl Backend for NativeBackend {
+    fn sharing_policy(&mut self, file: &File) -> io::Result<Option<u64>> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if linux::btrfs_info(file)?.is_none() {
+                return Ok(None);
+            }
+            // TREE_SEARCH needs privileges that ordinary portable users may
+            // not have. A failed policy probe must not disable deduplication.
+            Ok(crate::btrfs_io::inode(file, file.metadata()?.ino())
+                .ok()
+                .flatten()
+                .map(|inode| inode.flags & 1))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = file;
+            Ok(None)
+        }
+    }
+
     fn dedupe_with_savings(
         &mut self,
         source: &File,

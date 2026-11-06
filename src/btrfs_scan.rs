@@ -85,6 +85,7 @@ pub(crate) fn refresh_apply_mapping(
             incarnation,
             extents,
             cow: inode.cow(),
+            sharing_policy: inode.flags & 1,
             fingerprint: fingerprint.to_vec(),
         })
     };
@@ -688,6 +689,7 @@ fn file_job_at(
         incarnation: inode.generation.to_le_bytes().to_vec(),
         extents,
         cow: inode.cow(),
+        sharing_policy: inode.flags & 1,
         fingerprint,
     };
     let excluded = index

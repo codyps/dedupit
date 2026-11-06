@@ -872,3 +872,67 @@ fn savings_attribution_counts_successful_sharing_once() {
     assert_eq!(resumed.estimated_bytes_saved, 0);
     assert_eq!(resumed.savings_measured_bytes, 0);
 }
+
+#[test]
+fn sharing_policies_partition_candidates_and_reuse_compatible_representatives() {
+    use std::{collections::HashSet, os::unix::fs::MetadataExt};
+    struct PolicyBackend {
+        class_zero: HashSet<u64>,
+        comparisons: ComparingBackend,
+        probes: usize,
+    }
+    impl PolicyBackend {
+        fn class(&self, file: &File) -> u64 {
+            u64::from(!self.class_zero.contains(&file.metadata().unwrap().ino()))
+        }
+    }
+    impl Backend for PolicyBackend {
+        fn sharing_policy(&mut self, file: &File) -> io::Result<Option<u64>> {
+            self.probes += 1;
+            Ok(Some(self.class(file)))
+        }
+        fn dedupe(
+            &mut self,
+            source: &File,
+            dest: &File,
+            range: Range,
+            offset: u64,
+        ) -> io::Result<Outcome> {
+            assert_eq!(
+                self.class(source),
+                self.class(dest),
+                "incompatible policies reached the backend"
+            );
+            self.comparisons.dedupe(source, dest, range, offset)
+        }
+    }
+    let (_dir, options) = setup(Granularity::File);
+    for n in 0..128 {
+        put(&options, &format!("file-{n:03}"), &[42; 4096]);
+    }
+    run(&options, false).unwrap();
+    let connection = rusqlite::Connection::open(&options.database).unwrap();
+    let inodes: Vec<u64> = connection
+        .prepare("SELECT ino FROM files ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    drop(connection);
+    let mut backend = PolicyBackend {
+        class_zero: inodes[..64].iter().copied().collect(),
+        comparisons: ComparingBackend::default(),
+        probes: 0,
+    };
+    let result = run_with_backend(&options, true, &mut backend).unwrap();
+    assert!(result.errors.is_empty(), "{result:?}");
+    assert_eq!(result.jobs_completed, 126); // One representative for each class.
+    assert_eq!(result.incompatible_ranges, 1);
+    assert_eq!(backend.comparisons.calls, 126);
+    assert_eq!(backend.probes, 128); // Policies are reused across all pairings.
+    let again = run_with_backend(&options, true, &mut backend).unwrap();
+    assert!(again.errors.is_empty());
+    assert_eq!(again.jobs_completed, 0);
+    assert_eq!(backend.probes, 128);
+}

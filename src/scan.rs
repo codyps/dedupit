@@ -286,6 +286,7 @@ pub(crate) struct NativeView {
     pub incarnation: Vec<u8>,
     pub extents: Vec<Extent>,
     pub cow: bool,
+    pub sharing_policy: u64,
     pub fingerprint: Vec<u8>,
 }
 
@@ -373,6 +374,9 @@ fn index_file_inner(
         params![before.dev() as i64, before.ino() as i64],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?)),
     ).optional()?;
+    if let (Some((id, ..)), Some(view)) = (&existing, native) {
+        crate::index::save_sharing_policy(&index.conn, *id, view.sharing_policy)?;
+    }
     if let Some((_, _, _, seen)) = existing.as_ref() {
         if *seen {
             stats.hardlinks_skipped += 1;
@@ -447,6 +451,9 @@ fn index_file_inner(
             params![path_bytes(path), before.dev() as i64, before.ino() as i64, version, fs.key, fs.alignment])?;
         tx.last_insert_rowid()
     };
+    if let Some(view) = native {
+        crate::index::save_sharing_policy(&tx, file_id, view.sharing_policy)?;
+    }
     tx.execute_cached("INSERT INTO seen VALUES (?1)", [file_id])?;
     // Provisional apply maps may outlive the filesystem transaction that
     // produced them. With changed contents they cannot certify clean chunks.

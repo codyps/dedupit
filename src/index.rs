@@ -261,6 +261,9 @@ impl Index {
                dev INTEGER NOT NULL, ino INTEGER NOT NULL, fingerprint BLOB NOT NULL,
                fskey BLOB NOT NULL, alignment INTEGER NOT NULL,
                UNIQUE(dev, ino));
+             CREATE TABLE IF NOT EXISTS file_policies (
+               file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+               policy INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS ranges (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -288,7 +291,10 @@ impl Index {
              END;
              CREATE TEMP TABLE seen (file_id INTEGER PRIMARY KEY);
              CREATE TEMP TABLE apply_failed (id INTEGER PRIMARY KEY);
-             CREATE TEMP TABLE apply_crawls (id INTEGER PRIMARY KEY);",
+             CREATE TEMP TABLE apply_crawls (id INTEGER PRIMARY KEY);
+             CREATE TEMP TABLE class_sources (
+               kind INTEGER, hash BLOB, length INTEGER, fskey BLOB, policy INTEGER, source INTEGER,
+               PRIMARY KEY(kind,hash,length,fskey,policy));",
         )?;
         if version < 2 {
             conn.execute_batch(
@@ -705,13 +711,67 @@ impl Index {
         }
     }
 
+    fn policy(&self, id: i64, file: &File, backend: &mut dyn Backend) -> Result<Option<u64>> {
+        let cached = self
+            .conn
+            .query_row_cached(
+                "SELECT policy FROM file_policies WHERE file_id=?1",
+                [id],
+                |r| r.get::<_, u64>(0),
+            )
+            .optional()?;
+        if cached.is_some() {
+            return Ok(cached);
+        }
+        let policy = backend.sharing_policy(file)?;
+        if let Some(policy) = policy {
+            save_sharing_policy(&self.conn, id, policy)?;
+        }
+        Ok(policy)
+    }
+    fn class_source(&self, target: &Job, policy: u64) -> Result<Option<i64>> {
+        Ok(self.conn.query_row_cached("SELECT source FROM class_sources WHERE kind=?1 AND hash=?2 AND length=?3 AND fskey=?4 AND policy=?5",
+            params![target.kind,target.hash,target.len,target.fskey,policy], |r| r.get(0)).optional()?)
+    }
+    fn remember_class_source(&self, target: &Job, policy: u64, source: i64) -> Result<()> {
+        self.conn.execute_cached(
+            "INSERT OR REPLACE INTO class_sources VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                target.kind,
+                target.hash,
+                target.len,
+                target.fskey,
+                policy,
+                source
+            ],
+        )?;
+        Ok(())
+    }
+    fn forget_class_source(&self, target: &Job, policy: u64) -> Result<()> {
+        self.conn.execute_cached("DELETE FROM class_sources WHERE kind=?1 AND hash=?2 AND length=?3 AND fskey=?4 AND policy=?5",params![target.kind,target.hash,target.len,target.fskey,policy])?;
+        Ok(())
+    }
+
     fn apply_target(
         &mut self,
         target: &Job,
         backend: &mut dyn Backend,
         stats: &mut Stats,
     ) -> Result<()> {
-        let mut cursor = 0;
+        let mut target_policy: Option<u64> = self
+            .conn
+            .query_row_cached(
+                "SELECT policy FROM file_policies WHERE file_id=?1",
+                [target.file_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut expected = target_policy
+            .map(|policy| self.class_source(target, policy))
+            .transpose()?
+            .flatten()
+            .filter(|id| *id < target.id);
+        let mut cursor = expected.map_or(0, |id| id - 1);
         let mut found = false;
         loop {
             // Deterministic lowest-ID representative, not all O(n^2) pairs.
@@ -722,7 +782,10 @@ impl Index {
                 .query_row_cached(
                     &format!(
                         "{JOB_SELECT} WHERE r.kind=?1 AND r.hash=?2 AND r.length=?3
-                          AND r.id>?4 AND r.id<?5 AND f.fskey=?6 ORDER BY r.id LIMIT 1"
+                          AND r.id>?4 AND r.id<?5 AND f.fskey=?6
+                          AND (?7 IS NULL OR NOT EXISTS(SELECT 1 FROM file_policies p WHERE p.file_id=f.id)
+                               OR EXISTS(SELECT 1 FROM file_policies p WHERE p.file_id=f.id AND p.policy=?7))
+                          ORDER BY r.id LIMIT 1"
                     ),
                     params![
                         target.kind,
@@ -730,12 +793,39 @@ impl Index {
                         target.len,
                         cursor,
                         target.id,
-                        target.fskey
+                        target.fskey,
+                        target_policy
                     ],
                     Job::from_row,
                 )
                 .optional()?;
+            if let Some(cached) = expected.take() {
+                if source.as_ref().map(|source| source.id) != Some(cached) {
+                    if let Some(policy) = target_policy {
+                        self.forget_class_source(target, policy)?;
+                    }
+                    cursor = 0;
+                    continue;
+                }
+            }
             let Some(source) = source else {
+                if let Some(policy) = target_policy {
+                    let older_match: bool = self.conn.query_row_cached(
+                        "SELECT EXISTS(SELECT 1 FROM ranges r JOIN files f ON f.id=r.file_id JOIN file_policies p ON p.file_id=f.id WHERE r.kind=?1 AND r.hash=?2 AND r.length=?3 AND r.id<?4 AND f.fskey=?5 AND p.policy!=?6)",
+                        params![target.kind,target.hash,target.len,target.id,target.fskey,policy], |r| r.get(0))?;
+                    if older_match {
+                        // This target is the first representative of its class.
+                        // Later targets can seek directly here rather than
+                        // repeatedly scanning the incompatible class prefix.
+                        self.remember_class_source(target, policy, target.id)?;
+                        self.conn.execute_cached(
+                            "UPDATE ranges SET pending=0 WHERE id=?1",
+                            [target.id],
+                        )?;
+                        stats.incompatible_ranges += 1;
+                        return Ok(());
+                    }
+                }
                 if !found {
                     self.conn
                         .execute_cached("UPDATE ranges SET pending=0 WHERE id=?1", [target.id])?;
@@ -789,6 +879,23 @@ impl Index {
                     return Ok(());
                 }
             };
+            let source_policy = self.policy(source.file_id, &source_file, backend)?;
+            if target_policy.is_none() {
+                target_policy = self.policy(target.file_id, &destination, backend)?;
+            }
+            if let (Some(source_policy), Some(policy)) = (source_policy, target_policy) {
+                if source_policy != policy {
+                    if let Some(cached) = self
+                        .class_source(target, policy)?
+                        .filter(|id| *id < target.id)
+                    {
+                        cursor = cached - 1;
+                        expected = Some(cached);
+                    }
+                    continue;
+                }
+                self.remember_class_source(target, policy, source.id)?;
+            }
             let alignment = target.alignment.max(source.alignment);
             if source.offset % alignment != 0 || target.offset % alignment != 0 {
                 stats.unsupported += 1;
@@ -938,6 +1045,15 @@ impl Index {
 
 fn ranges_overlap(a: u64, b: u64, length: u64) -> bool {
     a.abs_diff(b) < length
+}
+
+pub(crate) fn save_sharing_policy(
+    connection: &Connection,
+    file_id: i64,
+    policy: u64,
+) -> Result<()> {
+    connection.execute_cached("INSERT INTO file_policies VALUES (?1,?2) ON CONFLICT(file_id) DO UPDATE SET policy=excluded.policy WHERE policy!=excluded.policy", params![file_id,policy])?;
+    Ok(())
 }
 
 const DUPLICATE_GROUPS: &str = "SELECT kind,hash,length FROM ranges

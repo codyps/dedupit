@@ -87,6 +87,8 @@ pub struct Stats {
     /// Logical bytes of successful sharing covered by physical estimation.
     pub savings_measured_bytes: u64,
     pub unsupported: u64,
+    /// Matching content exists, but no candidate has a compatible known policy.
+    pub incompatible_ranges: u64,
     pub stale: u64,
     pub errors: Vec<String>,
 }

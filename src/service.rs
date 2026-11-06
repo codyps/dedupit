@@ -843,6 +843,13 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         false,
     );
     row(
+        "Incompatible ranges",
+        progress.as_ref().map(|s| s.incompatible_ranges),
+        result.as_ref().map(|s| s.incompatible_ranges),
+        None,
+        false,
+    );
+    row(
         "File errors",
         progress.as_ref().map(|s| s.errors.len() as u64),
         result.as_ref().map(|s| s.errors.len() as u64),

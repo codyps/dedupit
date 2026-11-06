@@ -12,7 +12,7 @@ pkgs.testers.runNixOSTest {
     };
     # Format and populate only the disposable test disk before starting dedupit.
     systemd.services.dedupit.wantedBy = lib.mkForce [ ];
-    environment.systemPackages = [ pkgs.btrfs-progs ];
+    environment.systemPackages = [ pkgs.btrfs-progs pkgs.e2fsprogs ];
   };
   testScript = ''
     import json
@@ -82,5 +82,21 @@ pkgs.testers.runNixOSTest {
     assert held["bytes_deduped"] > 0, held
     assert held["estimated_bytes_saved"] == 0, held
     assert held["savings_measured_bytes"] > 0, held
+    # Equal content across COW/NOCOW classes must be skipped, while equal
+    # content within each class still shares without changing file policies.
+    machine.succeed("mkdir -p /mnt/fixture/mixed/nocow /mnt/fixture/mixed/cow")
+    machine.succeed("chattr +C /mnt/fixture/mixed/nocow")
+    machine.succeed("dd if=/dev/urandom of=/mnt/fixture/mixed/nocow/a bs=4096 count=16 status=none")
+    machine.succeed("cp --reflink=never /mnt/fixture/mixed/nocow/a /mnt/fixture/mixed/nocow/b")
+    machine.succeed("cp --reflink=never /mnt/fixture/mixed/nocow/a /mnt/fixture/mixed/cow/a")
+    machine.succeed("cp --reflink=never /mnt/fixture/mixed/nocow/a /mnt/fixture/mixed/cow/b && sync")
+    mixed = json.loads(machine.succeed("dedupit --database /tmp/mixed.sqlite --scanner btrfs --granularity file --apply --json /mnt/fixture/mixed"))
+    assert mixed["errors"] == [], mixed
+    assert mixed["jobs_completed"] >= 2, mixed
+    assert mixed["incompatible_ranges"] >= 1, mixed
+    machine.succeed("cmp /mnt/fixture/mixed/nocow/a /mnt/fixture/mixed/cow/b")
+    machine.succeed("lsattr /mnt/fixture/mixed/nocow/a | grep -q C")
+    machine.fail("lsattr /mnt/fixture/mixed/cow/a | cut -d ' ' -f1 | grep -q C")
+
   '';
 }
