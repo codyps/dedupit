@@ -35,8 +35,16 @@ pkgs.testers.runNixOSTest {
     scoped = json.loads(machine.succeed("dedupit --database /tmp/scoped.sqlite --scanner btrfs --json /mnt/fixture/one/scoped"))
     assert scoped["files_hashed"] == 1, scoped
     assert scoped["errors"] == [], scoped
+    # Keep the live index on the scanned volume, reachable through a different
+    # mount path. Its aliases must be rejected before open/close can drop locks.
+    machine.succeed("mkdir -p /mnt/fixture/state /var/lib/dedupit; mount --bind /mnt/fixture/state /var/lib/dedupit")
     machine.succeed("systemctl start dedupit.service")
     machine.wait_until_succeeds("dedupit stats --json | grep -q '\"completed_runs\": [1-9]'")
+    # Exercise concurrent external SQLite clients across active/idle reader and
+    # writer handoffs. Previously scanning SHM aliases discarded POSIX locks.
+    machine.succeed("for i in $(seq 1 40); do sqlite3 -readonly -cmd '.timeout 2000' /var/lib/dedupit/filesystem.sqlite 'SELECT count(*) FROM files' >/dev/null; sleep 0.05; done")
+    machine.succeed("systemctl is-active dedupit.service")
+    assert machine.succeed("systemctl show dedupit.service -p NRestarts --value").strip() == "0"
     report = json.loads(machine.succeed("dedupit stats --json"))
     assert report["status"]["totals"]["bytes_deduped"] >= 2 * 1024 * 1024, report
     assert report["last_result"]["btrfs_subvolumes"] >= 3, report
@@ -59,7 +67,10 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds("dedupit stats --json | grep -q '\"state\": \"completed\"'")
     report = json.loads(machine.succeed("dedupit stats --json"))
     assert report["status"]["totals"]["completed_runs"] > previous, report
-    assert report["last_result"]["bytes_hashed"] == 0, report
+    # The database now lives in scope, so its small mutable JSON reports are
+    # legitimate new work. The unchanged multi-MiB fixtures must remain cached.
+    assert report["last_result"]["bytes_hashed"] < 65536, report
+    assert report["last_result"]["files_unchanged"] >= 2, report
     machine.succeed("systemctl stop dedupit.service")
     # Compressed copies should report encoded allocation sizes, not their
     # much larger logical lengths. Run outside the service's periodic loop.

@@ -667,8 +667,17 @@ fn file_job_at(
     stats: &mut Stats,
     path: &Path,
 ) -> Result<()> {
+    let candidate = fs::symlink_metadata(path)?;
+    if index.is_excluded(path, &candidate) {
+        return Ok(());
+    }
     let file = scan::open_regular(path, false)?;
     let before = file.metadata()?;
+    if index.is_excluded(path, &before) {
+        index.defer_close(file);
+        return Ok(());
+    }
+
     ensure!(
         before.ino() == ino && source.same_tree(&file, &crawl.file)?,
         "resolved path changed identity"
@@ -1091,6 +1100,29 @@ mod tests {
             prefix: PathBuf::new(),
         };
         (index, crawl)
+    }
+    #[test]
+    fn native_sqlite_aliases_preserve_posix_locks_before_metadata_capture() {
+        let (_dir, options, mut source, _) = setup(Granularity::Both);
+        let (mut index, crawl) = open(&options, &source);
+        let shm = options.database.with_file_name("index.sqlite-shm");
+        crate::lock_tests::assert_sqlite_locks(&options.database, &shm);
+        for (name, path) in [("database-alias", &options.database), ("shm-alias", &shm)] {
+            let alias = options.roots[0].join(name);
+            fs::hard_link(path, &alias).unwrap();
+            let ino = fs::symlink_metadata(&alias).unwrap().ino();
+            file_job_at(
+                &mut index,
+                &crawl,
+                ino,
+                &options,
+                &mut source,
+                &mut Stats::default(),
+                &alias,
+            )
+            .unwrap();
+        }
+        crate::lock_tests::assert_sqlite_locks(&options.database, &shm);
     }
     fn cycle(options: &Options, source: &mut Fake) -> Result<Stats> {
         let (mut index, crawl) = open(options, source);

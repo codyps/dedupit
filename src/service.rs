@@ -304,19 +304,35 @@ impl Monitor {
         Ok(())
     }
 }
-impl RunObserver for Monitor {
-    fn phase(&self, phase: &'static str) -> Result<()> {
-        self.checkpoint()?;
-        // Start only after Index::open has queued any unconfirmed mappings
-        // from a previous process. During this live process, newly captured
-        // provisional maps reflect successful sharing and belong in the estimate.
-        let start_inventory = phase == "Scanning files" && self.inventory.borrow().is_none();
-        if start_inventory {
+impl Monitor {
+    fn stop_inventory(&self) {
+        let worker = self.inventory.borrow_mut().take();
+        drop(worker);
+    }
+    fn start_inventory(&self) {
+        if self.inventory.borrow().is_none() {
             *self.inventory.borrow_mut() = Some(crate::inventory::Worker::start(
                 self.directory.clone(),
                 self.inventory_hardlinks,
                 self.minimum,
             ));
+        }
+    }
+}
+impl RunObserver for Monitor {
+    fn before_index_close(&self) {
+        self.stop_inventory();
+    }
+    fn phase(&self, phase: &'static str) -> Result<()> {
+        self.checkpoint()?;
+        if phase == "Opening index" {
+            self.stop_inventory();
+        }
+        // Start only after Index::open has queued any unconfirmed mappings
+        // from a previous process. During this live process, newly captured
+        // provisional maps reflect successful sharing and belong in the estimate.
+        if phase == "Scanning files" {
+            self.start_inventory();
         }
         {
             let mut status = self.status.borrow_mut();
@@ -633,6 +649,16 @@ pub fn run(args: ServiceArgs) -> Result<()> {
             );
         }
         monitor.write()?;
+        // Idle inventories can finish even when the scan itself was brief.
+        // Stop them before the next index opens raw SQLite/WAL guard handles.
+        if !STOP.load(Ordering::Relaxed)
+            && matches!(
+                monitor.status.borrow().state,
+                "completed" | "finished_with_errors"
+            )
+        {
+            monitor.start_inventory();
+        }
         let deadline = Instant::now() + Duration::from_secs(args.interval);
         while !STOP.load(Ordering::Relaxed) && Instant::now() < deadline {
             std::thread::sleep(

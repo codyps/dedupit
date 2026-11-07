@@ -4,10 +4,22 @@ use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension, Params, Row};
 use std::{
     fs::{self, File, OpenOptions},
-    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
+    },
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+// Explicit unlock also releases locks inherited by a concurrently spawning
+// child. Relying only on close() can leave a short-lived child holding them.
+struct FlockGuard(File);
+impl Drop for FlockGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
 
 pub(crate) struct Index {
     pub observer: Option<std::rc::Rc<dyn crate::RunObserver>>,
@@ -21,8 +33,20 @@ pub(crate) struct Index {
     pub mapping_sync: std::collections::HashMap<i64, File>,
     #[cfg(target_os = "linux")]
     pub crawl_prefixes: std::collections::HashMap<i64, PathBuf>,
-    _lock: File,
-    _database: File,
+    _lock: FlockGuard,
+    _database: FlockGuard,
+    // A raced alias to SQLite must not close until all SQLite connections are
+    // gone: close() cancels the process's POSIX locks on that inode.
+    deferred_files: Vec<File>,
+}
+
+impl Drop for Index {
+    fn drop(&mut self) {
+        if let Some(observer) = &self.observer {
+            observer.before_index_close();
+        }
+        // Fields close conn first, then the inode guard/deferred raw handles.
+    }
 }
 
 pub(crate) enum ScanPhase {
@@ -450,9 +474,22 @@ impl Index {
                 commits: 0,
                 poisoned: false,
             },
-            _lock: lock,
-            _database: db_file,
+            _lock: FlockGuard(lock),
+            _database: FlockGuard(db_file),
+            deferred_files: Vec::new(),
         })
+    }
+
+    pub(crate) fn is_excluded(&self, path: &Path, metadata: &fs::Metadata) -> bool {
+        self.excluded.iter().any(|excluded| {
+            excluded == path
+                || fs::symlink_metadata(excluded)
+                    .is_ok_and(|m| m.dev() == metadata.dev() && m.ino() == metadata.ino())
+        })
+    }
+
+    pub(crate) fn defer_close(&mut self, file: File) {
+        self.deferred_files.push(file);
     }
 
     pub fn checkpoint(&self) -> Result<()> {

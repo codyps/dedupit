@@ -352,8 +352,21 @@ fn index_file_inner(
     excluded_ids: &[(u64, u64)],
     native: Option<&NativeView>,
 ) -> Result<()> {
+    // Check aliases by inode before opening anything. Even a read-only open /
+    // close of SQLite's main or SHM file can discard its process-wide locks.
+    let candidate = fs::symlink_metadata(path)?;
+    if index.is_excluded(path, &candidate)
+        || excluded_ids.contains(&(candidate.dev(), candidate.ino()))
+    {
+        return Ok(());
+    }
     let file = open_regular(path, false)?;
     let before = file.metadata()?;
+    if index.is_excluded(path, &before) || excluded_ids.contains(&(before.dev(), before.ino())) {
+        index.defer_close(file);
+        return Ok(());
+    }
+
     ensure!(
         before.len() <= i64::MAX as u64,
         "file too large for the index"
@@ -364,10 +377,6 @@ fn index_file_inner(
             view.fingerprint == version,
             "file changed during extent lookup"
         );
-    }
-    // Exclude hardlinks to the index, WAL and lock as well as their paths.
-    if excluded_ids.contains(&(before.dev(), before.ino())) {
-        return Ok(());
     }
     let existing: Option<(i64, Vec<u8>, Vec<u8>, bool)> = index.conn.query_row_cached(
         "SELECT id,fingerprint,path,EXISTS(SELECT 1 FROM seen WHERE file_id=file_paths.id) FROM file_paths WHERE dev=?1 AND ino=?2",
@@ -833,6 +842,46 @@ fn next_data(file: &File, offset: u64) -> io::Result<Option<u64>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn excluded_sqlite_aliases_do_not_cancel_posix_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        fs::create_dir(&data).unwrap();
+        let options = Options {
+            database: dir.path().join("index.sqlite"),
+            roots: vec![data.clone()],
+            chunk_size: 4096,
+            granularity: Granularity::Both,
+            verify: false,
+            scanner: crate::Scanner::Portable,
+            commit_batch_size: 64,
+            storage: crate::storage::Storage::Cow,
+        };
+        let mut index = Index::open(&options).unwrap();
+        let shm = dir.path().join("index.sqlite-shm");
+        crate::lock_tests::assert_sqlite_locks(&options.database, &shm);
+        let ids = index
+            .excluded
+            .iter()
+            .filter_map(|p| fs::symlink_metadata(p).ok())
+            .map(|m| (m.dev(), m.ino()))
+            .collect::<Vec<_>>();
+        for (name, source) in [("database-alias", &options.database), ("shm-alias", &shm)] {
+            let alias = data.join(name);
+            fs::hard_link(source, &alias).unwrap();
+            index_file(
+                &mut index,
+                &alias,
+                &options,
+                &mut Stats::default(),
+                &ids,
+                None,
+            )
+            .unwrap();
+        }
+        crate::lock_tests::assert_sqlite_locks(&options.database, &shm);
+    }
+
     #[test]
     fn compact_inline_maps_reuse_unchanged_chunks_but_detect_payload_edits() {
         let mut raw = vec![0; 21];

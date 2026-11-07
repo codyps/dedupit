@@ -222,6 +222,67 @@ pub fn compact(database: &Path, storage: Storage) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn dependent_readers_close_before_raw_guards_on_success_and_error() {
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+        struct Observer {
+            database: PathBuf,
+            reader: RefCell<Option<Connection>>,
+            closed: Cell<bool>,
+            fail: bool,
+        }
+        impl crate::RunObserver for Observer {
+            fn checkpoint(&self) -> Result<()> {
+                Ok(())
+            }
+            fn phase(&self, phase: &'static str) -> Result<()> {
+                if phase == "Scanning files" {
+                    let connection = Connection::open_with_flags(
+                        &self.database,
+                        OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )?;
+                    connection
+                        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, i64>(0))?;
+                    *self.reader.borrow_mut() = Some(connection);
+                    ensure!(!self.fail, "injected scan failure");
+                }
+                Ok(())
+            }
+            fn before_index_close(&self) {
+                self.reader.borrow_mut().take();
+                self.closed.set(true);
+            }
+        }
+        for fail in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("data");
+            fs::create_dir(&data).unwrap();
+            fs::write(data.join("f"), b"data").unwrap();
+            let options = crate::Options {
+                database: dir.path().join("index.sqlite"),
+                roots: vec![data],
+                chunk_size: 4096,
+                granularity: crate::Granularity::Both,
+                verify: false,
+                scanner: crate::Scanner::Portable,
+                commit_batch_size: 64,
+                storage: Storage::Cow,
+            };
+            let observer = Rc::new(Observer {
+                database: options.database.clone(),
+                reader: RefCell::new(None),
+                closed: Cell::new(false),
+                fail,
+            });
+            let outcome = crate::run_observed(&options, false, observer.clone());
+            assert_eq!(outcome.is_err(), fail);
+            assert!(observer.closed.get());
+            assert!(observer.reader.borrow().is_none());
+        }
+    }
+    #[test]
     fn compaction_keeps_hashes_and_scan_progress_and_refuses_a_live_index() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("data");

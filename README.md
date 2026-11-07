@@ -151,6 +151,14 @@ readable. Roots/chunk configuration still bind the incremental index.
 `stats` also reads the database footprint (DB + WAL + SHM file sizes) as
 `database` in JSON. File sizes can change during measurement.
 
+SQLite's own main/WAL/SHM/journal files and their inode aliases are excluded
+before opening a file, for both native and portable scans. A raced alias is kept
+open until SQLite and dependent readers have closed. This matters on POSIX:
+closing any raw descriptor for a SQLite inode cancels the process's advisory
+locks, even if it was opened read-only. The service also closes inventory readers
+before opening or closing an index's raw inode guard, then restarts inventory
+while idle so brief scans do not prevent estimates from completing.
+
 Normal text and JSON stats read small, buffered snapshots. The live status
 contains at most ten error examples plus `errors_total`, and completed runs have
 `filesystem-result-summary.json` for the same fast path. Neither normal mode

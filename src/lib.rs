@@ -11,6 +11,8 @@ mod btrfs_scan;
 #[cfg(feature = "test-failpoints")]
 mod failpoints;
 mod index;
+#[cfg(test)]
+mod lock_tests;
 mod paths;
 mod records;
 #[cfg(target_os = "linux")]
@@ -166,8 +168,12 @@ pub fn list_duplicates(
 }
 
 /// Cooperative service control. Errors abort the current batch, leaving committed
-/// progress reusable. Callbacks run on the scanning thread; they must not block.
+/// progress reusable. Regular callbacks run on the scanning thread and must not
+/// block. The closing callback may join dependent reader threads.
 pub trait RunObserver {
+    /// Close dependent SQLite readers before the index closes its raw inode
+    /// guard. Called on success and failure, even after cancellation.
+    fn before_index_close(&self) {}
     fn phase(&self, _phase: &'static str) -> Result<()> {
         self.checkpoint()
     }
