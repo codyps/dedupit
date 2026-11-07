@@ -132,6 +132,11 @@ impl Group {
     }
 }
 
+fn is_contention(error: &anyhow::Error) -> bool {
+    matches!(error.downcast_ref::<rusqlite::Error>(),Some(rusqlite::Error::SqliteFailure(code,_))
+        if matches!(code.code,rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+}
+
 pub(crate) struct Worker {
     stop: Arc<AtomicBool>,
     interrupt: Arc<Mutex<Option<rusqlite::InterruptHandle>>>,
@@ -154,11 +159,7 @@ impl Worker {
                     thread::sleep(Duration::from_millis(200));
                     continue;
                 }
-                report.refresh = Estimate {
-                    as_of: crate::service::now(),
-                    include_hardlinks,
-                    ..Default::default()
-                };
+                report.refresh.include_hardlinks = include_hardlinks;
                 report.state = "Checking indexed files".into();
                 report.error = None;
                 let outcome = refresh(
@@ -176,6 +177,7 @@ impl Worker {
                 // reader releases its snapshot. Do not wait an hour for its
                 // next write to reclaim the WAL's retained allocation.
                 let _ = checkpoint(&directory);
+                let waiting = outcome.as_ref().is_err_and(is_contention);
                 match outcome {
                     Ok(()) if report.refresh.verified_files == 0 => {
                         report.state = "Waiting for verified native extent mappings".into();
@@ -185,6 +187,9 @@ impl Worker {
                         report.estimate = Some(report.refresh.clone());
                         report.state = "Complete".into();
                     }
+                    Err(error) if is_contention(&error) => {
+                        report.state = "Waiting for scanner transaction".into();
+                    }
                     Err(error) => {
                         report.state = "Refresh failed".into();
                         report.error = Some(format!("{error:#}"));
@@ -192,7 +197,9 @@ impl Worker {
                 }
                 let _ = write(&directory, &mut report);
                 // Poll the durable change queue; idle polls read only small inventory tables.
-                let wait = if report.error.is_some()
+                let wait = if waiting {
+                    1
+                } else if report.error.is_some()
                     || report.refresh.indexed_files == 0
                     || report.refresh.verified_files == 0
                 {
@@ -372,7 +379,7 @@ fn file_batch_with(
 
 fn group_batch(connection: &mut Connection, stop: &AtomicBool) -> Result<usize> {
     let keys = connection
-        .prepare_cached("SELECT fskey,physical FROM inventory_dirty_groups LIMIT 512")?
+        .prepare_cached("SELECT fskey,physical FROM inventory_dirty_groups LIMIT 128")?
         .query_map([], |r| {
             Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
         })?
@@ -571,6 +578,33 @@ use std::os::unix::ffi::OsStringExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn writer_contention_is_retryable_and_other_errors_remain_visible() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("db");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE x(a); BEGIN IMMEDIATE;")
+            .unwrap();
+        let contender = Connection::open(&path).unwrap();
+        contender.busy_timeout(Duration::ZERO).unwrap();
+        let error: anyhow::Error = contender
+            .execute_batch("BEGIN IMMEDIATE;")
+            .unwrap_err()
+            .into();
+        assert!(is_contention(&error));
+        assert!(!is_contention(&anyhow::anyhow!(
+            "inventory paused for free space"
+        )));
+        assert!(!is_contention(
+            &contender
+                .execute_batch("SELECT missing FROM x")
+                .unwrap_err()
+                .into()
+        ));
+        writer.execute_batch("COMMIT").unwrap();
+        contender.execute_batch("BEGIN IMMEDIATE; COMMIT;").unwrap();
+    }
     #[test]
     fn current_estimate_unions_ranges_and_counts_existing_links_once() {
         let mut estimate = Estimate::default();
