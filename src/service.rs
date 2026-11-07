@@ -4,10 +4,10 @@ use dedupit::{Granularity, Options, RunObserver, Scanner, Stats};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::CString,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, BufRead, BufReader, BufWriter, Write},
     os::unix::{
         ffi::OsStrExt,
         fs::{DirBuilderExt, OpenOptionsExt},
@@ -61,6 +61,9 @@ pub struct StatsArgs {
     state_directory: PathBuf,
     #[arg(long)]
     json: bool,
+    /// Stream full file-error details instead of the bounded preview.
+    #[arg(long, conflicts_with = "json")]
+    errors: bool,
 }
 
 #[derive(Debug)]
@@ -199,14 +202,16 @@ pub(super) fn save(path: &Path, value: &impl Serialize) -> Result<()> {
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let temporary = path.with_extension(format!("{}.{}.tmp", std::process::id(), stamp));
     let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&temporary)?;
-        serde_json::to_writer_pretty(&mut file, value)?;
-        writeln!(file)?;
-        file.sync_all()?;
+        let mut output = BufWriter::with_capacity(64 * 1024, file);
+        serde_json::to_writer_pretty(&mut output, value)?;
+        writeln!(output)?;
+        output.flush()?;
+        output.get_ref().sync_all()?;
         fs::rename(&temporary, path)?;
         File::open(path.parent().context("report has no parent")?)?.sync_all()?;
         Ok(())
@@ -220,7 +225,8 @@ pub(super) fn save(path: &Path, value: &impl Serialize) -> Result<()> {
 fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     match File::open(path) {
         Ok(file) => Ok(Some(
-            serde_json::from_reader(file).with_context(|| format!("read {}", path.display()))?,
+            serde_json::from_reader(BufReader::with_capacity(64 * 1024, file))
+                .with_context(|| format!("read {}", path.display()))?,
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("open {}", path.display())),
@@ -248,6 +254,7 @@ struct Monitor {
     reported: RefCell<Instant>,
     inventory: RefCell<Option<crate::inventory::Worker>>,
     inventory_hardlinks: bool,
+    logged_errors: Cell<usize>,
 }
 impl Monitor {
     fn write(&self) -> Result<()> {
@@ -268,9 +275,25 @@ impl Monitor {
 }
 impl Monitor {
     fn record(&self, stats: &Stats) -> Result<()> {
+        let logged = self.logged_errors.get().min(stats.errors.len());
+        if logged < stats.errors.len() {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(self.directory.join("filesystem-errors.jsonl"))?;
+            let mut output = BufWriter::with_capacity(64 * 1024, file);
+            for error in &stats.errors[logged..] {
+                serde_json::to_writer(&mut output, error)?;
+                writeln!(output)?;
+            }
+            output.flush()?;
+            output.get_ref().sync_all()?;
+            self.logged_errors.set(stats.errors.len());
+        }
         {
             let mut status = self.status.borrow_mut();
-            let previous = std::mem::replace(&mut status.progress, stats.clone());
+            let previous = std::mem::replace(&mut status.progress, stats.summary(10));
             status.activity.observe(&previous, stats);
             status.updated_at = now();
         }
@@ -475,6 +498,27 @@ pub fn run(args: ServiceArgs) -> Result<()> {
         // is already included; count the abandoned scan without adding it again.
         totals.interrupted_runs += 1;
     }
+    // Retain oversized legacy diagnostics without copying hundreds of MiB or
+    // creating a gap in the live status file before its atomic replacement.
+    if previous
+        .as_ref()
+        .and_then(|s| s["progress"]["errors"].as_array())
+        .is_some_and(|e| e.len() > 10)
+    {
+        let archive = directory.join(format!("filesystem-status-legacy-{}.json", now()));
+        if !archive.exists() {
+            fs::hard_link(directory.join("filesystem-status.json"), archive)?;
+        }
+    }
+    drop(previous);
+    if !directory.join("filesystem-result-summary.json").exists() {
+        if let Some(result) = read_optional::<Stats>(&directory.join("filesystem-result.json"))? {
+            save(
+                &directory.join("filesystem-result-summary.json"),
+                &result.summary(10),
+            )?;
+        }
+    }
     let monitor = Rc::new(Monitor {
         directory,
         minimum: args.minimum_free_bytes,
@@ -495,8 +539,23 @@ pub fn run(args: ServiceArgs) -> Result<()> {
         reported: RefCell::new(Instant::now()),
         inventory: RefCell::new(None),
         inventory_hardlinks: args.device.is_some(),
+        logged_errors: Cell::new(0),
     });
     while !STOP.load(Ordering::Relaxed) {
+        let error_log = monitor.directory.join("filesystem-errors.jsonl");
+        if error_log.exists() {
+            fs::rename(
+                &error_log,
+                monitor.directory.join("filesystem-errors-previous.jsonl"),
+            )?;
+        }
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&error_log)?;
+        monitor.logged_errors.set(0);
         {
             let mut status = monitor.status.borrow_mut();
             status.state = "running";
@@ -525,6 +584,10 @@ pub fn run(args: ServiceArgs) -> Result<()> {
                     };
                     // Keep the last complete report if a future run is interrupted.
                     save(&monitor.directory.join("filesystem-result.json"), &stats)?;
+                    save(
+                        &monitor.directory.join("filesystem-result-summary.json"),
+                        &stats.summary(10),
+                    )?;
                     status.totals.completed_runs += 1;
                     status.totals.partial_runs += u64::from(!stats.errors.is_empty());
                     status.totals.files_hashed += stats.files_hashed;
@@ -534,7 +597,7 @@ pub fn run(args: ServiceArgs) -> Result<()> {
                     status.totals.bytes_already_shared += stats.bytes_already_shared;
                     status.totals.estimated_bytes_saved += stats.estimated_bytes_saved;
                     status.totals.savings_measured_bytes += stats.savings_measured_bytes;
-                    status.progress = stats;
+                    status.progress = stats.summary(10);
                 }
                 Err(error) => {
                     status.state = match error.downcast_ref::<Paused>() {
@@ -624,7 +687,12 @@ fn database_size(directory: &Path) -> Result<Option<DatabaseSize>> {
 pub fn stats(args: StatsArgs) -> Result<()> {
     let status =
         read_optional::<serde_json::Value>(&args.state_directory.join("filesystem-status.json"))?;
-    let result = read_optional::<Stats>(&args.state_directory.join("filesystem-result.json"))?;
+    let result =
+        match read_optional::<Stats>(&args.state_directory.join("filesystem-result-summary.json"))?
+        {
+            Some(summary) => Some(summary),
+            None => read_optional::<Stats>(&args.state_directory.join("filesystem-result.json"))?,
+        };
     if status.is_none() && result.is_none() {
         bail!(
             "no recorded statistics in {}",
@@ -850,9 +918,16 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         false,
     );
     row(
+        "Read-only skips",
+        progress.as_ref().map(|s| s.readonly_ranges),
+        result.as_ref().map(|s| s.readonly_ranges),
+        None,
+        false,
+    );
+    row(
         "File errors",
-        progress.as_ref().map(|s| s.errors.len() as u64),
-        result.as_ref().map(|s| s.errors.len() as u64),
+        progress.as_ref().map(Stats::error_count),
+        result.as_ref().map(Stats::error_count),
         None,
         false,
     );
@@ -870,22 +945,53 @@ pub fn stats(args: StatsArgs) -> Result<()> {
             count(totals.interrupted_runs)
         );
     }
-    // Prefer errors from the current run; retain the last report's errors while
-    // the next run is still discovering files or after a service restart.
-    let errors = progress
-        .as_ref()
-        .filter(|s| !s.errors.is_empty())
-        .or(result.as_ref());
-    if let Some(report) = errors.filter(|s| !s.errors.is_empty()) {
-        println!("\n  Recent file errors");
-        for error in report.errors.iter().take(10) {
-            println!("    {error}");
+    let current_errors = progress.as_ref().is_some_and(|s| s.error_count() > 0);
+    if args.errors {
+        println!("\n  File errors");
+        if current_errors {
+            match File::open(args.state_directory.join("filesystem-errors.jsonl")) {
+                Ok(file) => {
+                    let mut output = BufWriter::new(io::stdout().lock());
+                    for line in BufReader::with_capacity(64 * 1024, file).lines() {
+                        let error: String = serde_json::from_str(&line?)?;
+                        writeln!(output, "  {error}")?;
+                    }
+                    output.flush()?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if let Some(stats) = &progress {
+                        for error in &stats.errors {
+                            println!("  {error}");
+                        }
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else if let Some(full) =
+            read_optional::<Stats>(&args.state_directory.join("filesystem-result.json"))?
+        {
+            for error in &full.errors {
+                println!("  {error}");
+            }
         }
-        if report.errors.len() > 10 {
-            println!(
-                "    … {} more (use --json for the full list)",
-                count((report.errors.len() - 10) as u64)
-            );
+    } else {
+        let report = if current_errors {
+            progress.as_ref()
+        } else {
+            result.as_ref()
+        };
+        if let Some(report) = report.filter(|s| s.error_count() > 0) {
+            println!("\n  Recent file errors");
+            for error in report.errors.iter().take(10) {
+                println!("    {error}");
+            }
+            let shown = report.errors.len().min(10) as u64;
+            if report.error_count() > shown {
+                println!(
+                    "    … {} more (use --errors for full details)",
+                    count(report.error_count() - shown)
+                );
+            }
         }
     }
 
@@ -983,5 +1089,69 @@ mod progress_tests {
             recover_activity(Some(&interrupted)).unwrap().scans_started,
             2
         );
+    }
+}
+
+#[cfg(test)]
+mod summary_io_tests {
+    use super::*;
+    #[test]
+    fn live_summary_stays_small_and_full_error_log_is_incremental() {
+        let directory = tempfile::tempdir().unwrap();
+        let monitor = Monitor {
+            directory: directory.path().to_owned(),
+            minimum: 0,
+            status: RefCell::new(Status {
+                state: "running",
+                pid: 1,
+                started_at: 0,
+                updated_at: 0,
+                finished_at: None,
+                free_bytes: 0,
+                error: None,
+                progress: Stats::default(),
+                totals: Totals::default(),
+                activity: Activity::default(),
+                phase: "test",
+            }),
+            checked: RefCell::new(Instant::now()),
+            reported: RefCell::new(Instant::now()),
+            inventory: RefCell::new(None),
+            inventory_hardlinks: false,
+            logged_errors: Cell::new(0),
+        };
+        let mut stats = Stats {
+            files_seen: 123,
+            errors: (0..200)
+                .map(|n| format!("error {n}: {}", "x".repeat(1000)))
+                .collect(),
+            ..Default::default()
+        };
+        monitor.record(&stats).unwrap();
+        monitor.record(&stats).unwrap();
+        let status: serde_json::Value =
+            read_optional(&directory.path().join("filesystem-status.json"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(status["progress"]["errors_total"], 200);
+        assert_eq!(status["progress"]["errors"].as_array().unwrap().len(), 10);
+        assert!(
+            fs::metadata(directory.path().join("filesystem-status.json"))
+                .unwrap()
+                .len()
+                < 16000
+        );
+        let log = directory.path().join("filesystem-errors.jsonl");
+        assert_eq!(
+            BufReader::new(File::open(&log).unwrap()).lines().count(),
+            200
+        );
+        stats.errors.push("one new error".into());
+        monitor.record(&stats).unwrap();
+        assert_eq!(
+            BufReader::new(File::open(&log).unwrap()).lines().count(),
+            201
+        );
+        assert_eq!(monitor.status.borrow().progress.error_count(), 201);
     }
 }

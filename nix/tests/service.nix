@@ -97,6 +97,17 @@ pkgs.testers.runNixOSTest {
     machine.succeed("cmp /mnt/fixture/mixed/nocow/a /mnt/fixture/mixed/cow/b")
     machine.succeed("lsattr /mnt/fixture/mixed/nocow/a | grep -q C")
     machine.fail("lsattr /mnt/fixture/mixed/cow/a | cut -d ' ' -f1 | grep -q C")
+    machine.succeed("mkdir -p /mnt/fixture/readonly-case")
+    machine.succeed("dd if=/dev/urandom of=/mnt/fixture/readonly-case/source bs=4096 count=16 status=none")
+    machine.succeed("btrfs subvolume create /mnt/fixture/readonly-case/readonly")
+    machine.succeed("cp --reflink=never /mnt/fixture/readonly-case/source /mnt/fixture/readonly-case/readonly/copy && sync")
+    machine.succeed("btrfs property set -t s /mnt/fixture/readonly-case/readonly ro true")
+    readonly = json.loads(machine.succeed("dedupit --database /tmp/readonly.sqlite --scanner btrfs --granularity file --apply --json /mnt/fixture/readonly-case"))
+    assert readonly["errors"] == [], readonly
+    assert readonly["readonly_ranges"] >= 1, readonly
+    machine.succeed("cmp /mnt/fixture/readonly-case/source /mnt/fixture/readonly-case/readonly/copy")
+    machine.succeed("btrfs property get -t s /mnt/fixture/readonly-case/readonly ro | grep -q 'ro=true'")
+
 
   '';
 }

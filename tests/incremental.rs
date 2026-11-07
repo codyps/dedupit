@@ -936,3 +936,22 @@ fn sharing_policies_partition_candidates_and_reuse_compatible_representatives() 
     assert_eq!(again.jobs_completed, 0);
     assert_eq!(backend.probes, 128);
 }
+
+#[test]
+fn stats_summary_bounds_error_details_without_losing_counts_or_counters() {
+    let stats = dedupit::Stats {
+        files_seen: 123456,
+        bytes_deduped: 987654,
+        errors: (0..10000)
+            .map(|n| format!("error {n}: {}", "x".repeat(1000)))
+            .collect(),
+        ..Default::default()
+    };
+    let summary = stats.summary(10);
+    assert_eq!(summary.errors.len(), 10);
+    assert_eq!(summary.error_count(), 10000);
+    assert_eq!(summary.files_seen, stats.files_seen);
+    assert_eq!(summary.bytes_deduped, stats.bytes_deduped);
+    assert!(serde_json::to_vec(&summary).unwrap().len() < 16000);
+    assert_eq!(summary.summary(10).error_count(), 10000);
+}

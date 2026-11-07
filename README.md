@@ -77,6 +77,8 @@ sudo dedupit service --device /dev/mapper/root --scanner btrfs --apply
 # Current progress, last complete report, and cumulative counters.
 sudo dedupit stats
 sudo dedupit stats --json
+# Full file-error diagnostics (explicit streaming read).
+sudo dedupit stats --errors
 ```
 
 `--interval SECONDS` defaults to 3600 seconds after a run finishes or pauses.
@@ -99,7 +101,7 @@ Reports are private files in `--state-directory` (default `/var/lib/dedupit`):
 
 - `filesystem.sqlite`: incremental index, reusable after interruption.
 - `filesystem-status.json`: state, timestamps (Unix seconds), free space,
-  current/latest run counters, errors, and cumulative totals. Updated at most
+  current/latest run counters, a bounded error sample, and cumulative totals. Updated at most
   every five seconds when work reaches a checkpoint, and at run boundaries.
 - `filesystem-result.json`: last complete run's statistics, including file errors.
   An interrupted or paused run does not replace it.
@@ -148,6 +150,20 @@ Duplicate-group counts await scan completion. Earlier one-shot reports remain
 readable. Roots/chunk configuration still bind the incremental index.
 `stats` also reads the database footprint (DB + WAL + SHM file sizes) as
 `database` in JSON. File sizes can change during measurement.
+
+Normal text and JSON stats read small, buffered snapshots. The live status
+contains at most ten error examples plus `errors_total`, and completed runs have
+`filesystem-result-summary.json` for the same fast path. Neither normal mode
+reads the SQLite contents, a full diagnostic report, or the detailed error log.
+`stats --errors` explicitly streams full current-run errors from
+`filesystem-errors.jsonl`; the preceding run's log is retained as
+`filesystem-errors-previous.jsonl`. Full completed reports remain in
+`filesystem-result.json`. Oversized live reports from older versions are retained
+as hardlinked `filesystem-status-legacy-TIMESTAMP.json` archives during migration.
+Expected read-only destinations count as `Read-only skips` (`readonly_ranges`)
+rather than adding one error string per rejected range. They remain pending for
+a later run in case the subvolume becomes writable; their read-only flags stay
+intact. Unexpected I/O failures remain errors.
 
 A crash or forced kill can leave the latest status stale; `stats` shows its age.
 Reports use atomic replacement. Fatal scan failures and busy files are logged

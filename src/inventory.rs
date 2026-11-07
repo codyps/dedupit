@@ -44,7 +44,9 @@ pub(crate) struct Report {
 
 pub(crate) fn read(directory: &Path) -> Result<Option<Report>> {
     match fs::File::open(directory.join("sharing-inventory.json")) {
-        Ok(file) => Ok(Some(serde_json::from_reader(file)?)),
+        Ok(file) => Ok(Some(serde_json::from_reader(
+            std::io::BufReader::with_capacity(64 * 1024, file),
+        )?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }

@@ -686,8 +686,12 @@ impl Index {
     ) -> Result<()> {
         let attempted = stats.jobs_attempted;
         let stale = stats.stale;
+        let readonly = stats.readonly_ranges;
         self.apply_target(target, backend, stats)?;
-        if stats.jobs_attempted != attempted || stats.stale != stale {
+        if stats.jobs_attempted != attempted
+            || stats.stale != stale
+            || stats.readonly_ranges != readonly
+        {
             self.conn.execute_cached(
                 "INSERT OR IGNORE INTO apply_failed SELECT id FROM ranges WHERE id=?1 AND pending=1", [target.id],
             )?;
@@ -867,6 +871,13 @@ impl Index {
             let destination = match target.open(true) {
                 Ok(file) => file,
                 Err(error) => {
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.raw_os_error() == Some(libc::EROFS))
+                    {
+                        stats.readonly_ranges += 1;
+                        return Ok(());
+                    }
                     // Permission errors must remain retryable; only invalidate
                     // when a read-only reopen also fails identity validation.
                     if target.open(false).is_err() {

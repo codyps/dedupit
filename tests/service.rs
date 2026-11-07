@@ -175,3 +175,66 @@ fn stats_without_reports_and_service_without_roots_fail_clearly() {
         .status
         .success());
 }
+
+#[test]
+fn normal_stats_reads_small_summaries_and_only_explicit_errors_reads_the_log() {
+    let directory = tempfile::tempdir().unwrap();
+    let status = serde_json::json!({"state":"running", "progress": {
+        "files_seen":123, "errors":["sample error"], "errors_total":1000000
+    }, "totals":{}, "activity":{}});
+    fs::write(
+        directory.path().join("filesystem-status.json"),
+        status.to_string(),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("filesystem-result-summary.json"),
+        r#"{"files_seen":456}"#,
+    )
+    .unwrap();
+    // A full diagnostic report is deliberately unreadable JSON. Normal stats
+    // must not touch it when its compact completed-run summary is available.
+    fs::write(
+        directory.path().join("filesystem-result.json"),
+        b"large diagnostic archive; do not parse",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("filesystem-errors.jsonl"),
+        b"not JSON; normal stats must not read this either",
+    )
+    .unwrap();
+    let invoke = |flags: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_dedupit"))
+            .args(["stats", "--state-directory"])
+            .arg(directory.path())
+            .args(flags)
+            .output()
+            .unwrap()
+    };
+    let human = invoke(&[]);
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(String::from_utf8(human.stdout)
+        .unwrap()
+        .contains("1,000,000"));
+    let json = invoke(&["--json"]);
+    assert!(json.status.success());
+    let json: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(json["status"]["progress"]["errors_total"], 1000000);
+    assert_eq!(json["last_result"]["files_seen"], 456);
+    assert!(!invoke(&["--errors"]).status.success());
+    fs::write(
+        directory.path().join("filesystem-errors.jsonl"),
+        b"\"first detail\"\n\"second detail\"\n",
+    )
+    .unwrap();
+    let details = invoke(&["--errors"]);
+    assert!(details.status.success());
+    assert!(String::from_utf8(details.stdout)
+        .unwrap()
+        .contains("second detail"));
+}

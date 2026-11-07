@@ -89,8 +89,55 @@ pub struct Stats {
     pub unsupported: u64,
     /// Matching content exists, but no candidate has a compatible known policy.
     pub incompatible_ranges: u64,
+    /// Destinations on a read-only filesystem/subvolume; retried next run.
+    pub readonly_ranges: u64,
+    /// Full count retained when `errors` is only a bounded sample.
+    pub errors_total: u64,
     pub stale: u64,
     pub errors: Vec<String>,
+}
+impl Stats {
+    pub fn error_count(&self) -> u64 {
+        self.errors_total.max(self.errors.len() as u64)
+    }
+
+    /// Keep counters and a small diagnostic sample without cloning a large log.
+    pub fn summary(&self, limit: usize) -> Self {
+        Self {
+            database_batches: self.database_batches,
+            btrfs_subvolumes: self.btrfs_subvolumes,
+            btrfs_search_pages: self.btrfs_search_pages,
+            btrfs_mapping_updates: self.btrfs_mapping_updates,
+            btrfs_events_reused: self.btrfs_events_reused,
+            discovery_jobs: self.discovery_jobs,
+            chunks_reused: self.chunks_reused,
+            scanner_fallbacks: self.scanner_fallbacks.clone(),
+            files_seen: self.files_seen,
+            files_hashed: self.files_hashed,
+            files_unchanged: self.files_unchanged,
+            hardlinks_skipped: self.hardlinks_skipped,
+            files_removed: self.files_removed,
+            bytes_hashed: self.bytes_hashed,
+            hole_bytes_skipped: self.hole_bytes_skipped,
+            duplicate_files: self.duplicate_files,
+            duplicate_file_bytes: self.duplicate_file_bytes,
+            duplicate_chunks: self.duplicate_chunks,
+            duplicate_chunk_bytes: self.duplicate_chunk_bytes,
+            jobs_attempted: self.jobs_attempted,
+            jobs_completed: self.jobs_completed,
+            interleaved_batches: self.interleaved_batches,
+            bytes_deduped: self.bytes_deduped,
+            bytes_already_shared: self.bytes_already_shared,
+            estimated_bytes_saved: self.estimated_bytes_saved,
+            savings_measured_bytes: self.savings_measured_bytes,
+            unsupported: self.unsupported,
+            incompatible_ranges: self.incompatible_ranges,
+            readonly_ranges: self.readonly_ranges,
+            errors_total: self.error_count(),
+            stale: self.stale,
+            errors: self.errors.iter().take(limit).cloned().collect(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -199,6 +246,7 @@ fn run_inner(
         stats.database_batches = index.batch_commits();
         Ok(())
     })();
+    stats.errors_total = stats.errors.len() as u64;
     if let Some(observer) = &observer {
         observer.finished(&stats)?;
     }
