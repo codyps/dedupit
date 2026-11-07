@@ -173,6 +173,9 @@ pub fn list_duplicates(
 /// progress reusable. Regular callbacks run on the scanning thread and must not
 /// block. The closing callback may join dependent reader threads.
 pub trait RunObserver {
+    /// After a committed batch, with the writer lock released. May briefly yield
+    /// to a pending background writer; must return within a bounded interval.
+    fn after_commit(&self) {}
     /// Close dependent SQLite readers before the index closes its raw inode
     /// guard. Called on success and failure, even after cancellation.
     fn before_index_close(&self) {}

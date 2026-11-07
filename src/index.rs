@@ -562,6 +562,9 @@ impl Index {
             self.conn.execute_batch("COMMIT")?;
             self.batch.active = false;
             self.batch.commits += 1;
+            if let Some(observer) = &self.observer {
+                observer.after_commit();
+            }
             #[cfg(feature = "test-failpoints")]
             self.test_hook(&format!("{}:after-commit", self.batch.phase))?;
         }

@@ -337,6 +337,9 @@ captures bounded batches, releases its read snapshot before filesystem metadata
 checks, and rechecks invalidation revisions in a short writer transaction before
 acknowledging work. It never holds a read snapshot over a full-volume walk.
 Interrupted verification or group reduction leaves durable work for restart.
+Expected SQLite writer contention waits and retries without reporting a failure.
+At scan commit boundaries the service gives a waiting inventory writer a bounded
+handoff (at most 120 ms), preventing a continuous scan from starving its updates.
 
 File hashes are staged directly in the batch transaction. A failed file's entire
 cache entry, including partial hashes, is invalidated before the batch can

@@ -137,12 +137,41 @@ fn is_contention(error: &anyhow::Error) -> bool {
         if matches!(code.code,rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
 }
 
+thread_local! {
+    // SQLite's busy timeout does not fairly hand the writer lock to another
+    // connection. Only the inventory thread registers a pending-write signal.
+    static WRITER_WAITING: std::cell::RefCell<Option<Arc<AtomicBool>>> = const {std::cell::RefCell::new(None)};
+}
+fn begin_write(connection: &mut Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    WRITER_WAITING.with(|pending| {
+        if let Some(flag) = pending.borrow().as_ref() {
+            flag.store(true, Ordering::Release);
+        }
+    });
+    let result = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate);
+    WRITER_WAITING.with(|pending| {
+        if let Some(flag) = pending.borrow().as_ref() {
+            flag.store(false, Ordering::Release);
+        }
+    });
+    result
+}
+
 pub(crate) struct Worker {
+    writer_waiting: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     interrupt: Arc<Mutex<Option<rusqlite::InterruptHandle>>>,
     thread: Option<JoinHandle<()>>,
 }
 impl Worker {
+    pub(crate) fn yield_to_writer(&self) {
+        // Called only after COMMIT, never while the scanner holds its writer
+        // lock. A bounded window covers SQLite's maximum busy-handler sleep.
+        let deadline = Instant::now() + Duration::from_millis(120);
+        while self.writer_waiting.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
     pub(crate) fn start(
         directory: PathBuf,
         include_hardlinks: bool,
@@ -150,9 +179,12 @@ impl Worker {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let interrupt = Arc::new(Mutex::new(None));
+        let writer_waiting = Arc::new(AtomicBool::new(false));
+        let worker_waiting = writer_waiting.clone();
         let worker_stop = stop.clone();
         let worker_interrupt = interrupt.clone();
         let thread = thread::spawn(move || {
+            WRITER_WAITING.with(|pending| *pending.borrow_mut() = Some(worker_waiting));
             let mut report = read(&directory).ok().flatten().unwrap_or_default();
             while !worker_stop.load(Ordering::Relaxed) {
                 if !directory.join("filesystem.sqlite").exists() {
@@ -214,6 +246,7 @@ impl Worker {
             }
         });
         Self {
+            writer_waiting,
             stop,
             interrupt,
             thread: Some(thread),
@@ -318,7 +351,7 @@ fn file_batch_with(
     if candidates.is_empty() && cursor >= ceiling {
         return Ok(0);
     }
-    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let tx = begin_write(connection)?;
     let mut checked_bytes = 0u64;
     for candidate in &candidates {
         let id = candidate.id;
@@ -387,7 +420,7 @@ fn group_batch(connection: &mut Connection, stop: &AtomicBool) -> Result<usize> 
     if keys.is_empty() {
         return Ok(0);
     }
-    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let tx = begin_write(connection)?;
     for (fskey, physical) in &keys {
         ensure!(!stop.load(Ordering::Relaxed), "inventory stopped");
         let mut statement = tx.prepare_cached("SELECT e.offset,e.length,e.descriptor,v.size,v.links

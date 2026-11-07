@@ -320,6 +320,11 @@ impl Monitor {
     }
 }
 impl RunObserver for Monitor {
+    fn after_commit(&self) {
+        if let Some(worker) = self.inventory.borrow().as_ref() {
+            worker.yield_to_writer();
+        }
+    }
     fn before_index_close(&self) {
         self.stop_inventory();
     }
