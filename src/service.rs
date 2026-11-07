@@ -839,7 +839,23 @@ pub fn stats(args: StatsArgs) -> Result<()> {
                 count(best.pending_jobs)
             );
         }
-        if inventory.state != "Complete" {
+        if inventory.refresh.incremental {
+            println!(
+                "  Inventory               {} · {} file updates · {} processed",
+                if inventory.refresh.bootstrap_complete {
+                    "incremental"
+                } else {
+                    "bootstrapping"
+                },
+                count(inventory.refresh.changed_files),
+                size(inventory.refresh.changed_file_bytes)
+            );
+            println!(
+                "    Pending              {} files · {} allocation groups",
+                count(inventory.refresh.pending_files),
+                count(inventory.refresh.pending_groups)
+            );
+        } else if inventory.state != "Complete" {
             println!(
                 "  {}: {} / {} indexed files · {} checked · {} extent data examined",
                 inventory.state,

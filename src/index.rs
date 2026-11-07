@@ -172,7 +172,7 @@ impl<'a> Interleaver<'a> {
 /// Repeated scan/job statements share a bounded connection-local cache, also
 /// through transactions and savepoints. Dropping a cached statement resets it
 /// and clears bindings before reuse; these helpers do not alter transaction boundaries.
-pub(crate) trait SqlCache {
+pub trait SqlCache {
     fn execute_cached(&self, sql: &str, params: impl Params) -> rusqlite::Result<usize>;
     fn query_row_cached<T>(
         &self,
@@ -443,6 +443,7 @@ impl Index {
         if version < 6 {
             crate::records::migrate(&conn)?;
         }
+        crate::inventory_state::initialize(&conn)?;
         // A process or machine crash may have preserved SQLite's provisional
         // maps but lost btrfs's transaction. Revisit them even if that rollback
         // leaves no new inode event. Never authorize skipping with these rows.

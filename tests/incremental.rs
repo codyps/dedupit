@@ -352,6 +352,13 @@ fn database_hardlink_cannot_bypass_inode_lock() {
 // Reconstruct the actual pre-normalization layout before simulating older
 // released versions; changing only user_version would create an invalid fixture.
 fn legacy_paths(conn: &rusqlite::Connection) {
+    // Released legacy schemas did not contain the derived inventory either.
+    let objects = conn.prepare("SELECT type,name FROM sqlite_master WHERE name LIKE 'inventory_%' ORDER BY CASE type WHEN 'trigger' THEN 0 WHEN 'index' THEN 1 ELSE 2 END").unwrap()
+        .query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    for (kind, name) in objects {
+        conn.execute_batch(&format!("DROP {kind} {name}")).unwrap();
+    }
     conn.execute_batch("PRAGMA foreign_keys=OFF; BEGIN;
       CREATE TABLE chunk_cache_old(file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,offset INTEGER NOT NULL,length INTEGER NOT NULL,hash BLOB NOT NULL,nonzero INTEGER NOT NULL,PRIMARY KEY(file_id,offset));
       INSERT INTO chunk_cache_old SELECT * FROM chunk_cache;

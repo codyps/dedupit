@@ -107,8 +107,8 @@ Reports are private files in `--state-directory` (default `/var/lib/dedupit`):
   An interrupted or paused run does not replace it.
 
 `stats` separates **Current sharing estimate (indexed files)** from
-**Dedupit activity history**. The current estimate is rebuilt from a consistent
-SQLite snapshot of the latest extent mappings; it does not add up run counters.
+**Dedupit activity history**. The current estimate maintains current extent
+reference groups transactionally; it does not add up run counters.
 It counts overlapping references to the same physical extents, so it includes
 sharing already present before dedupit (reflinks, snapshots, and other dedupe
 tools). Whole-volume services also count the current hardlink multiplicity.
@@ -120,10 +120,24 @@ even before the scan's final durability-confirmation barrier. It shows the verif
 bytes, queued reconciliation jobs, and age. While refreshing it also shows the
 amount of file and extent data examined. The estimate covers the indexed subset,
 not undiscovered files or the entire volume before indexing has caught up.
-Deleted/changed files are excluded, and repeated inventories do not accumulate
-savings. The background refresh uses metadata, not a second content/hash scan,
-and normally repeats every five minutes. Its private progress/cache file is
-`sharing-inventory.json`; JSON stats expose it as `sharing_inventory`.
+Changes discovered by the Btrfs generation scanner invalidate affected files
+and allocation groups in the same SQLite transaction. Only those files need
+metadata verification, and only those groups need their overlap unions recomputed.
+Deletions, hardlink changes, renamed paths, pending reconciliation, and extent
+remaps from dedupit or other programs flow through this queue. Estimates follow
+the scanner's progress; changes not yet discovered remain represented by their
+last indexed state.
+
+An existing index needs one initial metadata-verification bootstrap. Its cursor,
+verified records, allocation totals, and invalidation queues persist in SQLite,
+so restart resumes that work. The previous estimate stays visible during bootstrap.
+Subsequent idle polls (every 30 seconds) read the small progress tables without
+walking unchanged files, scanning all extent rows, or sorting the complete index.
+Stats show processed file updates/bytes and pending files/allocation groups.
+`sharing-inventory.json` is the small published report; JSON stats expose it as
+`sharing_inventory`. The inventory adds compact derived counts and a secondary
+physical-allocation index, rather than duplicating cached extent descriptors or
+chunk hashes. Portable-only indexes have no verified native mappings to estimate.
 
 `Saved (uncompressed)` is the currently redundant logical extent data among
 verified indexed files, including hardlinks for whole-volume services.
@@ -318,12 +332,11 @@ leave SQLite's full synchronous commits and recovery protocol enabled. Non-Btrfs
 filesystems keep their normal storage behavior.
 
 The WAL has a 64 MiB retained-size limit, applied when SQLite can reset it; this
-is not a hard limit on live transactions. Sharing inventory materializes only
-its required metadata into private disk-backed TEMP tables from one consistent
-snapshot, then releases the main read transaction before filesystem validation
-and extent sorting. This lets the scanner checkpoint/reuse its WAL during the
-slow stages without mixing database snapshots in one estimate. Temporary
-inventory storage is released when the refresh connection closes.
+is not a hard limit on live transactions. The incremental sharing inventory
+captures bounded batches, releases its read snapshot before filesystem metadata
+checks, and rechecks invalidation revisions in a short writer transaction before
+acknowledging work. It never holds a read snapshot over a full-volume walk.
+Interrupted verification or group reduction leaves durable work for restart.
 
 File hashes are staged directly in the batch transaction. A failed file's entire
 cache entry, including partial hashes, is invalidated before the batch can

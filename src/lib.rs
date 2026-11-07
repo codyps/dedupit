@@ -11,6 +11,8 @@ mod btrfs_scan;
 #[cfg(feature = "test-failpoints")]
 mod failpoints;
 mod index;
+#[doc(hidden)]
+pub mod inventory_state;
 #[cfg(test)]
 mod lock_tests;
 mod paths;

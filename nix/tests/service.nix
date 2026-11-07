@@ -58,6 +58,23 @@ pkgs.testers.runNixOSTest {
     # include their sharing, rather than merely sum this tool's accepted work.
     assert best["saved_uncompressed_bytes"] >= 200 * 2 * 1024 * 1024, current
     assert best["checked_file_bytes"] > 0 and best["verified_files"] > 0, current
+    assert best["incremental"] and best["bootstrap_complete"], current
+    # Let an external hardlink change pass through native Btrfs discovery into
+    # the inventory. It must replace current totals, not accumulate history.
+    machine.succeed("ln /mnt/fixture/two/b /mnt/fixture/two/extra; sync")
+    def inventory_saved():
+        value = json.loads(machine.succeed("dedupit stats --json"))["sharing_inventory"]
+        return (value["estimate"] or value["refresh"])["saved_uncompressed_bytes"]
+    machine.wait_until_succeeds("sqlite3 -readonly -cmd '.timeout 2000' /var/lib/dedupit/filesystem.sqlite \"SELECT count(*) FROM inventory_verified WHERE links=2\" | grep -q '[1-9]'")
+    # Inventory groups are independently durable; allow their bounded reducer.
+    import time
+    for _ in range(90):
+        if inventory_saved() >= best["saved_uncompressed_bytes"] + 2 * 1024 * 1024:
+            break
+        time.sleep(1)
+    else:
+        raise AssertionError("hardlink change did not update current savings")
+    machine.succeed("rm /mnt/fixture/two/extra; sync")
     machine.fail("mountpoint /run/dedupit/filesystem")
     machine.succeed("cmp /mnt/fixture/one/a /mnt/fixture/two/b")
     machine.succeed("systemctl stop dedupit.service")
@@ -169,6 +186,11 @@ pkgs.testers.runNixOSTest {
     initial = json.loads(machine.succeed(inline_command))
     assert initial["duplicate_files"] == 1, initial
     assert machine.succeed(f"sqlite3 {inline_db} 'SELECT max(length(descriptor)) FROM file_extents'").strip() == "53"
+    # Released v5 had no derived incremental inventory tables or triggers.
+    import shlex
+    inventory_objects = "SELECT type||' '||name FROM sqlite_master WHERE name LIKE 'inventory_%' ORDER BY CASE type WHEN 'trigger' THEN 0 WHEN 'index' THEN 1 ELSE 2 END"
+    for object_name in machine.succeed(f"sqlite3 {inline_db} {shlex.quote(inventory_objects)}").splitlines():
+        machine.succeed(f"sqlite3 {inline_db} {shlex.quote('DROP ' + object_name)}")
     # Reconstruct the real v5 duplicated cache and full inline payloads.
     downgrade = "PRAGMA foreign_keys=OFF; BEGIN; CREATE TABLE chunk_cache_v5(file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,offset INTEGER,length INTEGER,hash BLOB,nonzero INTEGER,PRIMARY KEY(file_id,offset)); INSERT INTO chunk_cache_v5 SELECT * FROM chunk_cache; DROP VIEW chunk_cache; DROP TABLE chunk_cache_extra; DROP TRIGGER invalidate_extent_baseline_range; ALTER TABLE chunk_cache_v5 RENAME TO chunk_cache; CREATE TRIGGER invalidate_extent_baseline AFTER DELETE ON chunk_cache BEGIN DELETE FROM extent_state WHERE file_id=OLD.file_id; END; UPDATE file_extents SET descriptor=CAST(substr(descriptor,1,21)||printf('%1799s',char())||'x' AS BLOB); PRAGMA user_version=5; COMMIT;"
     import shlex
