@@ -283,7 +283,7 @@ impl Workload {
             let completed: u64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM completed c JOIN ranges r ON r.id=c.target
-                 JOIN files f ON f.id=r.file_id WHERE r.kind=?1 AND f.path IN (?2,?3)",
+                 JOIN file_paths f ON f.id=r.file_id WHERE r.kind=?1 AND f.path IN (?2,?3)",
                     rusqlite::params![kind, paths[0], paths[1]],
                     |r| r.get(0),
                 )
@@ -625,7 +625,7 @@ pub(super) fn inventory(database: &Path, root: &Path) -> BTreeMap<(u64, u64), In
         "ok"
     );
     let files = conn
-        .prepare("SELECT id,dev,ino,path,fingerprint FROM files")
+        .prepare("SELECT id,dev,ino,path,fingerprint FROM file_paths")
         .unwrap()
         .query_map([], |r| {
             Ok((

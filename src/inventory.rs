@@ -216,6 +216,26 @@ impl Drop for Worker {
     }
 }
 
+fn capture(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TEMP TABLE inventory_files(file_id INTEGER PRIMARY KEY,path BLOB,fingerprint BLOB,fskey BLOB);
+         INSERT INTO temp.inventory_files
+           SELECT f.id,f.path,f.fingerprint,f.fskey FROM file_paths f
+           JOIN extent_state e ON e.file_id=f.id
+           JOIN btrfs_files b ON b.file_id=f.id
+           WHERE NOT EXISTS(SELECT 1 FROM discovery d WHERE d.crawl_id=b.crawl_id AND d.ino=b.ino);
+         CREATE TEMP TABLE inventory_extents AS
+           SELECT e.file_id,e.offset,e.length,substr(e.descriptor,1,53) AS descriptor
+           FROM file_extents e CROSS JOIN temp.inventory_files f WHERE f.file_id=e.file_id;
+         COMMIT;",
+    )?;
+    ensure!(
+        connection.is_autocommit(),
+        "inventory retained its main snapshot"
+    );
+    Ok(())
+}
+
 fn refresh(
     directory: &Path,
     stop: &AtomicBool,
@@ -243,13 +263,17 @@ fn refresh(
     report.refresh.pending_jobs =
         connection.query_row("SELECT COUNT(*) FROM discovery", [], |r| r.get(0))?;
     write(directory, report)?;
+    report.state = "Capturing indexed extent snapshot".into();
+    write(directory, report)?;
+    // Materialize only inventory inputs, then release the main WAL snapshot.
+    // Slow filesystem validation and sorting use TEMP exclusively. Inline file
+    // contents are not needed: all decoded extent fields fit in 53 bytes.
+    capture(&connection)?;
+    report.state = "Verifying indexed files".into();
+    write(directory, report)?;
     let mut last_report = Instant::now();
-    let mut files = connection.prepare(
-        "SELECT f.id,f.path,f.fingerprint FROM files f
-        JOIN extent_state e ON e.file_id=f.id
-        JOIN btrfs_files b ON b.file_id=f.id
-        WHERE NOT EXISTS(SELECT 1 FROM discovery d WHERE d.crawl_id=b.crawl_id AND d.ino=b.ino)",
-    )?;
+    let mut files =
+        connection.prepare("SELECT file_id,path,fingerprint FROM temp.inventory_files")?;
     let mut rows = files.query([])?;
     while let Some(row) = rows.next()? {
         ensure!(!stop.load(Ordering::Relaxed), "inventory stopped");
@@ -287,7 +311,7 @@ fn refresh(
     write(directory, report)?;
     let mut extents = connection.prepare(
         "SELECT f.fskey,e.offset,e.length,e.descriptor,v.size,v.links
-        FROM file_extents e JOIN files f ON f.id=e.file_id JOIN temp.verified v ON v.file_id=f.id
+        FROM temp.inventory_extents e JOIN temp.inventory_files f ON f.file_id=e.file_id JOIN temp.verified v ON v.file_id=f.file_id
         ORDER BY f.fskey,substr(e.descriptor,22,8)",
     )?;
     let mut rows = extents.query([])?;
@@ -344,7 +368,6 @@ fn refresh(
         }
     }
     group.finish(&mut report.refresh);
-    connection.execute_batch("ROLLBACK")?;
     Ok(())
 }
 
@@ -397,6 +420,7 @@ mod snapshot_tests {
         let connection = Connection::open(directory.path().join("filesystem.sqlite")).unwrap();
         connection.execute_batch("PRAGMA journal_mode=WAL;
             CREATE TABLE files(id INTEGER PRIMARY KEY,path BLOB,fingerprint BLOB,fskey BLOB);
+            CREATE VIEW file_paths AS SELECT * FROM files;
             CREATE TABLE extent_state(file_id INTEGER);
             CREATE TABLE btrfs_files(file_id INTEGER,crawl_id INTEGER,ino INTEGER);
             CREATE TABLE discovery(crawl_id INTEGER,ino INTEGER);
@@ -454,5 +478,60 @@ mod snapshot_tests {
         let after = run();
         assert_eq!(after.verified_files, 1);
         assert_eq!(after.saved_uncompressed_bytes, 4096);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    #[test]
+    fn materialized_inventory_survives_source_changes_without_pinning_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("index.sqlite");
+        let writer = Connection::open(&db).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL;
+          CREATE TABLE files(id INTEGER PRIMARY KEY,path BLOB,fingerprint BLOB,fskey BLOB);
+          CREATE VIEW file_paths AS SELECT * FROM files;
+          CREATE TABLE extent_state(file_id INTEGER);
+          CREATE TABLE btrfs_files(file_id INTEGER,crawl_id INTEGER,ino INTEGER);
+          CREATE TABLE discovery(crawl_id INTEGER,ino INTEGER);
+          CREATE TABLE file_extents(file_id INTEGER,offset INTEGER,length INTEGER,descriptor BLOB);
+          INSERT INTO files VALUES(1,x'2f61',x'01',x'02'); INSERT INTO extent_state VALUES(1);
+          INSERT INTO btrfs_files VALUES(1,1,1); INSERT INTO file_extents VALUES(1,0,4096,x'0304');").unwrap();
+        let reader = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        reader
+            .execute_batch("PRAGMA temp_store=FILE; BEGIN;")
+            .unwrap();
+        capture(&reader).unwrap();
+        writer
+            .execute_batch("UPDATE files SET fingerprint=x'ff'; DELETE FROM file_extents;")
+            .unwrap();
+        let busy: i64 = writer
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            busy, 0,
+            "inventory must release the main WAL before slow validation/sorting"
+        );
+        assert_eq!(
+            reader
+                .query_row(
+                    "SELECT hex(fingerprint) FROM temp.inventory_files",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "01"
+        );
+        assert_eq!(
+            reader
+                .query_row(
+                    "SELECT hex(descriptor) FROM temp.inventory_extents",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "0304"
+        );
     }
 }

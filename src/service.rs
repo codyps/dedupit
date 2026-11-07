@@ -25,6 +25,8 @@ extern "C" fn stop(_: libc::c_int) {
 
 #[derive(clap::Args)]
 pub struct ServiceArgs {
+    #[arg(long, value_enum, default_value = "cow")]
+    pub database_storage: dedupit::storage::Storage,
     /// Private persistent directory for the index, status and cumulative totals.
     #[arg(long, default_value = "/var/lib/dedupit")]
     state_directory: PathBuf,
@@ -469,6 +471,7 @@ pub fn run(args: ServiceArgs) -> Result<()> {
         .transpose()?;
     let options = Options {
         database: directory.join("filesystem.sqlite"),
+        storage: args.database_storage,
         roots: if volume.is_some() {
             vec![mount_point]
         } else {

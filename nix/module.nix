@@ -12,6 +12,8 @@ let
     "/run/dedupit/filesystem"
     "--scanner"
     "btrfs"
+    "--database-storage"
+    cfg.databaseStorage
     "--chunk-size"
     (toString cfg.chunkSize)
     "--interval"
@@ -37,6 +39,11 @@ in
       type = lib.types.bool;
       default = true;
       description = "Share duplicate ranges using kernel verification; false only records duplicate statistics.";
+    };
+    databaseStorage = lib.mkOption {
+      type = lib.types.enum [ "cow" "nocow" "compressed" "hybrid" ];
+      default = "cow";
+      description = "Btrfs SQLite policy. NOCOW avoids random-write COW amplification; hybrid compresses the main DB and uses a NOCOW WAL. Changes requiring NOCOW must first use offline dedupit compact.";
     };
     chunkSize = lib.mkOption {
       type = lib.types.ints.between 4096 16777216;

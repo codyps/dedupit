@@ -134,5 +134,20 @@ pkgs.testers.runNixOSTest {
         assert policy["errors"] == [], policy
         assert policy["bytes_deduped"] == 0, policy
 
+    # Offline compaction preserves hashes and supports explicit storage policies.
+    maintenance_db = "/mnt/fixture/maintenance.sqlite"
+    maintenance_root = "/mnt/fixture/readonly-False"
+    machine.succeed(f"dedupit --database {maintenance_db} --scanner btrfs --granularity file --json {maintenance_root}")
+    for storage in ["compressed", "hybrid", "nocow"]:
+        machine.succeed(f"dedupit compact --database {maintenance_db} --storage {storage}")
+        if storage == "nocow":
+            machine.succeed(f"lsattr {maintenance_db} | grep -q C")
+        else:
+            machine.succeed(f"btrfs property get {maintenance_db} compression | grep -q zstd")
+            machine.fail(f"lsattr {maintenance_db} | cut -d ' ' -f1 | grep -q C")
+        resumed = json.loads(machine.succeed(f"dedupit --database {maintenance_db} --database-storage {storage} --scanner btrfs --granularity file --apply --json {maintenance_root}"))
+        assert resumed["bytes_hashed"] == 0, resumed
+        assert resumed["errors"] == [], resumed
+
   '';
 }

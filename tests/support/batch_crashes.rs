@@ -63,6 +63,7 @@ fn durable_state(database: &Path) -> (Value, blake3::Hash) {
     let mut hash = blake3::Hasher::new();
     for table in [
         "files",
+        "path_parents",
         "ranges",
         "chunk_cache",
         "file_extents",
@@ -78,7 +79,14 @@ fn durable_state(database: &Path) -> (Value, blake3::Hash) {
     ] {
         hash.update(table.as_bytes());
         let mut statement = conn
-            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .prepare(&format!(
+                "SELECT * FROM {table} ORDER BY {}",
+                if table == "btrfs_dirs" {
+                    "crawl_id,ino"
+                } else {
+                    "rowid"
+                }
+            ))
             .unwrap();
         let columns = statement.column_count();
         let mut rows = statement.query([]).unwrap();
@@ -667,7 +675,7 @@ fn native_mapping_probe_failure_and_rolled_back_cache_leave_sharing_retryable() 
     let conn = Connection::open(&options.database).unwrap();
     conn.execute(
         "UPDATE file_extents SET descriptor=zeroblob(length(descriptor))
-        WHERE file_id=(SELECT id FROM files WHERE path=?1)",
+        WHERE file_id=(SELECT id FROM file_paths WHERE path=?1)",
         [options.roots[0]
             .join("file-001")
             .as_os_str()

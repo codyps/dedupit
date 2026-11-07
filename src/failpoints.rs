@@ -22,6 +22,11 @@ pub(crate) fn hit(conn: &Connection, event: &str) -> Result<()> {
     if std::env::var("DEDUPIT_TEST_ACTION").as_deref() == Ok("error") {
         bail!("injected test failure at {event}");
     }
+    // Force dirty pages into the WAL at the actual stop boundary, independent
+    // of record size. The crash test must cover spilled, uncommitted pages.
+    if !conn.is_autocommit() && std::env::var_os("DEDUPIT_TEST_SMALL_CACHE").is_some() {
+        conn.cache_flush()?;
+    }
     let mut marker = OpenOptions::new()
         .write(true)
         .create_new(true)

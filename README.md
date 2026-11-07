@@ -255,6 +255,51 @@ those budgets. `--commit-batch-size 1` selects individual operation commits;
 values through 4096 are supported. The policy can change when restarting the
 same index. SQLite remains in WAL mode with `synchronous=FULL`.
 
+Schema version 5 stores each file's directory once in `path_parents`, with a
+filename and directory ID in `files`. Native file mappings reuse that reference;
+directory parent indexes also use integer IDs. Paths remain arbitrary Unix byte
+strings. Upgrades retain file/range IDs, hashes, chunk caches, completed work,
+discovery jobs, and subvolume cursors. Migration is transactional and checks
+foreign keys before committing; interrupted migration rolls back on reopen.
+
+For an existing index, stop the service and compact it to reclaim the old layout:
+
+```console
+sudo systemctl stop dedupit.service
+sudo dedupit compact --database /var/lib/dedupit/filesystem.sqlite --storage nocow
+```
+
+`compact` refuses a live service/index, upgrades paths when needed, and uses
+`VACUUM INTO` to build a private replacement. It validates integrity and foreign
+keys, syncs the replacement, and atomically swaps it into place. Scan progress
+and reports remain intact. Allow space for both databases during this operation.
+A `.compact` file left by a killed process can be removed before retrying; the
+original index remains the authoritative copy until the atomic swap.
+
+Select storage with `--database-storage` (`--storage` for `compact`) or the NixOS
+`services.dedupit.databaseStorage` option:
+
+- `cow` preserves normal filesystem defaults (the compatibility default).
+- `nocow` uses uncompressed NOCOW main/WAL files on Btrfs. Changing an existing
+  COW main database to NOCOW requires offline compaction into an empty file.
+- `compressed` requests zstd for the COW main database, with a normal COW WAL.
+- `hybrid` requests zstd for the COW main database and NOCOW for the WAL.
+
+Compression and NOCOW are mutually exclusive for the same file. Random SQLite
+updates can fragment compressed extents and retain partially used allocations;
+measure steady-state disk use and writes rather than only an initial compression
+ratio. NOCOW also disables Btrfs data checksums for these files. These policies
+leave SQLite's full synchronous commits and recovery protocol enabled. Non-Btrfs
+filesystems keep their normal storage behavior.
+
+The WAL has a 64 MiB retained-size limit, applied when SQLite can reset it; this
+is not a hard limit on live transactions. Sharing inventory materializes only
+its required metadata into private disk-backed TEMP tables from one consistent
+snapshot, then releases the main read transaction before filesystem validation
+and extent sorting. This lets the scanner checkpoint/reuse its WAL during the
+slow stages without mixing database snapshots in one estimate. Temporary
+inventory storage is released when the refresh connection closes.
+
 File hashes are staged directly in the batch transaction. A failed file's entire
 cache entry, including partial hashes, is invalidated before the batch can
 commit, preserving successful neighbors. If that cleanup fails, the batch is

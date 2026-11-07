@@ -11,9 +11,11 @@ mod btrfs_scan;
 #[cfg(feature = "test-failpoints")]
 mod failpoints;
 mod index;
+mod paths;
 #[cfg(target_os = "linux")]
 mod savings;
 mod scan;
+pub mod storage;
 
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
@@ -50,6 +52,7 @@ pub struct Options {
     pub scanner: Scanner,
     /// Operations per durable database batch (1..=4096). May change on restart.
     pub commit_batch_size: usize,
+    pub storage: storage::Storage,
 }
 
 #[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]

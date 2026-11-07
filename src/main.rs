@@ -36,6 +36,8 @@ struct DuplicateRecord<'a> {
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    #[arg(long, value_enum, default_value = "cow")]
+    database_storage: dedupit::storage::Storage,
     /// Persistent SQLite index. Use the same index and roots on subsequent runs.
     #[arg(long, default_value = "dedupit.sqlite")]
     database: PathBuf,
@@ -73,6 +75,13 @@ enum Command {
     Service(service::ServiceArgs),
     /// Show current progress, the last report, and persistent cumulative totals.
     Stats(service::StatsArgs),
+    /// Compact an idle index and migrate paths without losing scan progress.
+    Compact {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long, value_enum, default_value = "cow")]
+        storage: dedupit::storage::Storage,
+    },
 }
 
 fn main() -> Result<()> {
@@ -80,10 +89,14 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Command::Service(args)) => return service::run(args),
         Some(Command::Stats(args)) => return service::stats(args),
+        Some(Command::Compact { database, storage }) => {
+            return dedupit::storage::compact(&database, storage)
+        }
         None => {}
     }
     let options = Options {
         database: cli.database,
+        storage: cli.database_storage,
         roots: cli.roots,
         chunk_size: cli.chunk_size,
         granularity: cli.granularity,

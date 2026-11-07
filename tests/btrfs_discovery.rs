@@ -17,6 +17,7 @@ fn setup() -> (tempfile::TempDir, Options) {
     let data = dir.path().join("data");
     fs::create_dir(&data).unwrap();
     let options = Options {
+        storage: dedupit::storage::Storage::Cow,
         database: dir.path().join("index.sqlite"),
         roots: vec![data],
         chunk_size: 4096,

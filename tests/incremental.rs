@@ -17,6 +17,7 @@ fn setup(granularity: Granularity) -> (TempDir, Options) {
     fs::create_dir(dir.path().join("data")).unwrap();
     let options = Options {
         database: dir.path().join("index.sqlite"),
+        storage: dedupit::storage::Storage::Cow,
         roots: vec![dir.path().join("data")],
         chunk_size: 4096,
         granularity,
@@ -202,7 +203,7 @@ fn deleted_representative_requeues_surviving_duplicates() {
     );
     let conn = rusqlite::Connection::open(&options.database).unwrap();
     let source: Vec<u8> = conn
-        .query_row("SELECT path FROM files ORDER BY id LIMIT 1", [], |r| {
+        .query_row("SELECT path FROM file_paths ORDER BY id LIMIT 1", [], |r| {
             r.get(0)
         })
         .unwrap();
@@ -348,6 +349,22 @@ fn database_hardlink_cannot_bypass_inode_lock() {
         .contains("inode is already in use"));
 }
 
+// Reconstruct the actual pre-normalization layout before simulating older
+// released versions; changing only user_version would create an invalid fixture.
+fn legacy_paths(conn: &rusqlite::Connection) {
+    conn.execute_batch("PRAGMA foreign_keys=OFF; BEGIN;
+      CREATE TABLE files_old(id INTEGER PRIMARY KEY AUTOINCREMENT,path BLOB NOT NULL UNIQUE,dev INTEGER NOT NULL,ino INTEGER NOT NULL,fingerprint BLOB NOT NULL,fskey BLOB NOT NULL,alignment INTEGER NOT NULL,UNIQUE(dev,ino));
+      INSERT INTO files_old SELECT id,path,dev,ino,fingerprint,fskey,alignment FROM file_paths;
+      CREATE TABLE btrfs_files_old(file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,crawl_id INTEGER REFERENCES crawls(id) ON DELETE CASCADE,ino INTEGER,parent BLOB,UNIQUE(crawl_id,ino));
+      INSERT INTO btrfs_files_old SELECT b.file_id,b.crawl_id,b.ino,p.path FROM btrfs_files b JOIN files f ON f.id=b.file_id JOIN path_parents p ON p.id=f.parent_id;
+      CREATE TABLE btrfs_dirs_old(crawl_id INTEGER REFERENCES crawls(id) ON DELETE CASCADE,ino INTEGER,path BLOB,parent BLOB,PRIMARY KEY(crawl_id,ino));
+      INSERT INTO btrfs_dirs_old SELECT b.crawl_id,b.ino,b.path,p.path FROM btrfs_dirs b JOIN path_parents p ON p.id=b.parent_id;
+      DROP VIEW file_paths; DROP TABLE btrfs_files; DROP TABLE btrfs_dirs; DROP TABLE files; DROP TABLE path_parents;
+      ALTER TABLE files_old RENAME TO files; ALTER TABLE btrfs_files_old RENAME TO btrfs_files; ALTER TABLE btrfs_dirs_old RENAME TO btrfs_dirs;
+      CREATE INDEX btrfs_file_parent ON btrfs_files(crawl_id,parent); CREATE INDEX btrfs_dir_parent ON btrfs_dirs(crawl_id,parent);
+      COMMIT; PRAGMA foreign_keys=ON;").unwrap();
+}
+
 #[test]
 fn version_three_upgrade_preserves_hashes_and_completed_jobs() {
     let (_dir, options) = setup(Granularity::Both);
@@ -356,6 +373,7 @@ fn version_three_upgrade_preserves_hashes_and_completed_jobs() {
     let applied = run_with_backend(&options, true, &mut ComparingBackend::default()).unwrap();
     assert!(applied.jobs_completed > 0);
     let conn = rusqlite::Connection::open(&options.database).unwrap();
+    legacy_paths(&conn);
     conn.execute_batch("DROP TABLE apply_mappings; PRAGMA user_version=3;")
         .unwrap();
     drop(conn);
@@ -366,7 +384,7 @@ fn version_three_upgrade_preserves_hashes_and_completed_jobs() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
             .unwrap(),
-        4
+        5
     );
 }
 
@@ -377,6 +395,7 @@ fn version_one_index_migrates_without_rehashing_portable_files() {
     put(&options, "b", &vec![1; 4096]);
     run(&options, false).unwrap();
     let conn = rusqlite::Connection::open(&options.database).unwrap();
+    legacy_paths(&conn);
     // Reproduce the previous released schema, preserving files/ranges/jobs.
     conn.execute_batch("DROP TABLE btrfs_files; DROP TABLE btrfs_dirs; DROP TABLE discovery; DROP TABLE crawls;
       DROP TABLE file_extents; DROP TABLE extent_state; DROP TABLE chunk_cache; PRAGMA user_version=1;").unwrap();
@@ -388,7 +407,7 @@ fn version_one_index_migrates_without_rehashing_portable_files() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
 }
 
@@ -422,7 +441,7 @@ fn old_zero_chunk_candidates_migrate_without_reading_files() {
         let hash = blake3::hash(&vec![0; length]);
         conn.execute(
             "INSERT INTO ranges(file_id,kind,offset,length,hash)
-            SELECT id,0,0,?1,?2 FROM files WHERE path=?3",
+            SELECT id,0,0,?1,?2 FROM file_paths WHERE path=?3",
             rusqlite::params![
                 length,
                 hash.as_bytes().as_slice(),
@@ -434,6 +453,7 @@ fn old_zero_chunk_candidates_migrate_without_reading_files() {
         )
         .unwrap();
     }
+    legacy_paths(&conn);
     conn.pragma_update(None, "user_version", 2).unwrap();
     drop(conn);
     let migrated = run(&options, false).unwrap();
@@ -447,7 +467,7 @@ fn old_zero_chunk_candidates_migrate_without_reading_files() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
 }
 

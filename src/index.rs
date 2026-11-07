@@ -243,18 +243,22 @@ impl Index {
         // Also lock the database inode: two different hardlinked names must not
         // bypass the single-writer guard by acquiring different sidecar locks.
         FileExt::try_lock_exclusive(&db_file).context("database inode is already in use")?;
+        crate::storage::prepare(&database, &db_file, options.storage)?;
         let conn = Connection::open(&database)?;
         // Enough for the scan/apply working set without growing with file count.
         conn.set_prepared_statement_cache_capacity(64);
         conn.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
         )?;
+        crate::paths::functions(&conn)?;
+        conn.execute_batch("PRAGMA journal_size_limit=67108864;")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            (0..=4).contains(&version),
+            (0..=5).contains(&version),
             "unsupported index schema version {version}"
         );
-        conn.execute_batch(
+        if version < 5 {
+            conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS files (
                id INTEGER PRIMARY KEY AUTOINCREMENT, path BLOB NOT NULL UNIQUE,
@@ -296,6 +300,12 @@ impl Index {
                kind INTEGER, hash BLOB, length INTEGER, fskey BLOB, policy INTEGER, source INTEGER,
                PRIMARY KEY(kind,hash,length,fskey,policy));",
         )?;
+        } else {
+            conn.execute_batch("CREATE TEMP TABLE seen(file_id INTEGER PRIMARY KEY);
+              CREATE TEMP TABLE apply_failed(id INTEGER PRIMARY KEY);
+              CREATE TEMP TABLE apply_crawls(id INTEGER PRIMARY KEY);
+              CREATE TEMP TABLE class_sources(kind INTEGER,hash BLOB,length INTEGER,fskey BLOB,policy INTEGER,source INTEGER,PRIMARY KEY(kind,hash,length,fskey,policy));")?;
+        }
         if version < 2 {
             conn.execute_batch(
                 "BEGIN IMMEDIATE;
@@ -402,6 +412,9 @@ impl Index {
                     file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE);
                 PRAGMA user_version=4; COMMIT;",
             )?;
+        }
+        if version < 5 {
+            crate::paths::migrate(&conn)?;
         }
         // A process or machine crash may have preserved SQLite's provisional
         // maps but lost btrfs's transaction. Revisit them even if that rollback
@@ -538,7 +551,7 @@ impl Index {
         self.check_batch()?;
         if let Err(error) = self
             .conn
-            .execute_cached("DELETE FROM files WHERE path=?1", [path_bytes(path)])
+            .execute_cached("DELETE FROM files WHERE parent_id=(SELECT id FROM path_parents WHERE path=dedupit_parent(?1)) AND name=dedupit_name(?1)", [path_bytes(path)])
         {
             self.batch.poisoned = true;
             return Err(error.into());
@@ -1133,10 +1146,10 @@ pub(crate) fn save_sharing_policy(
 const DUPLICATE_GROUPS: &str = "SELECT kind,hash,length FROM ranges
     GROUP BY kind,hash,length HAVING COUNT(*)>1 ORDER BY kind,hash,length";
 const DUPLICATE_RANGES: &str = "SELECT f.path,r.offset FROM ranges r
-    JOIN files f ON f.id=r.file_id WHERE r.kind=?1 AND r.hash=?2 AND r.length=?3 ORDER BY r.id";
+    JOIN file_paths f ON f.id=r.file_id WHERE r.kind=?1 AND r.hash=?2 AND r.length=?3 ORDER BY r.id";
 
 const JOB_SELECT: &str = "SELECT r.id,r.file_id,r.kind,r.offset,r.length,r.hash,
-    f.path,f.fingerprint,f.fskey,f.alignment FROM ranges r JOIN files f ON f.id=r.file_id";
+    f.path,f.fingerprint,f.fskey,f.alignment FROM ranges r JOIN file_paths f ON f.id=r.file_id";
 
 struct Job {
     id: i64,
@@ -1203,6 +1216,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE files (id INTEGER PRIMARY KEY, path BLOB);
+             CREATE VIEW file_paths AS SELECT * FROM files;
              CREATE TABLE ranges (id INTEGER PRIMARY KEY, file_id INTEGER,
                kind INTEGER, hash BLOB, length INTEGER, offset INTEGER);
              CREATE INDEX matches ON ranges(kind,hash,length,id); BEGIN;",

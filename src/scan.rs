@@ -370,7 +370,7 @@ fn index_file_inner(
         return Ok(());
     }
     let existing: Option<(i64, Vec<u8>, Vec<u8>, bool)> = index.conn.query_row_cached(
-        "SELECT id,fingerprint,path,EXISTS(SELECT 1 FROM seen WHERE file_id=files.id) FROM files WHERE dev=?1 AND ino=?2",
+        "SELECT id,fingerprint,path,EXISTS(SELECT 1 FROM seen WHERE file_id=file_paths.id) FROM file_paths WHERE dev=?1 AND ino=?2",
         params![before.dev() as i64, before.ino() as i64],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?,r.get(3)?)),
     ).optional()?;
@@ -418,17 +418,18 @@ fn index_file_inner(
         }
     }
     let tx = FileUpdate::new(&mut index.conn)?;
+    let (parent, name) = crate::paths::intern(&tx, path)?;
     // A name may now refer to a different inode. Invalidate it atomically with
     // insertion/rename of the current inode's row.
     tx.execute_cached(
-        "DELETE FROM files WHERE path=?1 AND (dev!=?2 OR ino!=?3)",
-        params![path_bytes(path), before.dev() as i64, before.ino() as i64],
+        "DELETE FROM files WHERE parent_id=?1 AND name=?2 AND (dev!=?3 OR ino!=?4)",
+        params![parent, name, before.dev() as i64, before.ino() as i64],
     )?;
     if let Some((id, previous, _, _)) = existing.as_ref() {
         if !options.verify && version == *previous && native.is_none() {
             tx.execute_cached(
-                "UPDATE files SET path=?1 WHERE id=?2",
-                params![path_bytes(path), id],
+                "UPDATE files SET parent_id=?1,name=?2 WHERE id=?3",
+                params![parent, name, id],
             )?;
             tx.execute_cached("INSERT INTO seen VALUES (?1)", [id])?;
             tx.commit()?;
@@ -442,13 +443,13 @@ fn index_file_inner(
         .map(|(_, fp, ..)| u64::from_le_bytes(fp[16..24].try_into().unwrap()));
     let file_id = if let Some((id, _, _, _)) = existing {
         tx.execute_cached(
-            "UPDATE files SET path=?1,fingerprint=?2,fskey=?3,alignment=?4 WHERE id=?5",
-            params![path_bytes(path), version, fs.key, fs.alignment, id],
+            "UPDATE files SET parent_id=?1,name=?2,fingerprint=?3,fskey=?4,alignment=?5 WHERE id=?6",
+            params![parent, name, version, fs.key, fs.alignment, id],
         )?;
         id
     } else {
-        tx.execute_cached("INSERT INTO files(path,dev,ino,fingerprint,fskey,alignment) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![path_bytes(path), before.dev() as i64, before.ino() as i64, version, fs.key, fs.alignment])?;
+        tx.execute_cached("INSERT INTO files(parent_id,name,dev,ino,fingerprint,fskey,alignment) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![parent, name, before.dev() as i64, before.ino() as i64, version, fs.key, fs.alignment])?;
         tx.last_insert_rowid()
     };
     if let Some(view) = native {

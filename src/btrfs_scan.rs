@@ -709,7 +709,7 @@ fn file_job_at(
         )
         .optional()?;
     if let Some(file_id) = file_id {
-        index.conn.execute_cached("INSERT INTO btrfs_files VALUES (?1,?2,?3,?4) ON CONFLICT(file_id) DO UPDATE SET crawl_id=excluded.crawl_id,ino=excluded.ino,parent=excluded.parent",params![file_id,crawl.id,ino,path_bytes(path.parent().unwrap())])?;
+        index.conn.execute_cached("INSERT INTO btrfs_files VALUES (?1,?2,?3) ON CONFLICT(file_id) DO UPDATE SET crawl_id=excluded.crawl_id,ino=excluded.ino",params![file_id,crawl.id,ino])?;
     }
     Ok(())
 }
@@ -774,7 +774,10 @@ fn directory_job(
                                 crawl.id,
                                 child,
                                 path_bytes(entry.path()),
-                                path_bytes(entry.path().parent().unwrap())
+                                crate::paths::directory_id(
+                                    &index.conn,
+                                    entry.path().parent().unwrap()
+                                )?
                             ],
                         )?;
                         queue(index, crawl.id, child, true)?;
@@ -799,7 +802,7 @@ fn directory_job(
     // evidence for looking up its former children and pruning deleted names.
     // These cursors read only files/btrfs_dirs while queue writes discovery.
     // Streaming avoids retaining a second copy of a wide directory's paths.
-    let mut files = index.conn.prepare_cached("SELECT b.ino,f.path FROM btrfs_files b JOIN files f ON f.id=b.file_id WHERE b.crawl_id=?1 AND b.parent=?2")?;
+    let mut files = index.conn.prepare_cached("SELECT b.ino,f.path FROM btrfs_files b JOIN file_paths f ON f.id=b.file_id WHERE b.crawl_id=?1 AND f.parent_id=(SELECT id FROM path_parents WHERE path=?2)")?;
     let mut files = files.query(params![crawl.id, path_bytes(&path)])?;
     let mut names = None;
     while let Some(row) = files.next()? {
@@ -823,7 +826,7 @@ fn directory_job(
         }
     }
     let mut dirs = index.conn.prepare_cached(
-        "SELECT ino,path FROM btrfs_dirs WHERE crawl_id=?1 AND parent=?2 AND ino!=?3",
+        "SELECT ino,path FROM btrfs_dirs WHERE crawl_id=?1 AND parent_id=(SELECT id FROM path_parents WHERE path=?2) AND ino!=?3",
     )?;
     let dirs = dirs.query_map(params![crawl.id, path_bytes(&path), ino], |r| {
         Ok((r.get(0)?, r.get(1)?))
@@ -837,7 +840,7 @@ fn directory_job(
             queue(index, crawl.id, child, true)?;
         }
     }
-    index.conn.execute_cached("INSERT INTO btrfs_dirs VALUES (?1,?2,?3,?4) ON CONFLICT(crawl_id,ino) DO UPDATE SET path=excluded.path,parent=excluded.parent",params![crawl.id,ino,path_bytes(&path),path_bytes(path.parent().unwrap_or(&path))])?;
+    index.conn.execute_cached("INSERT INTO btrfs_dirs VALUES (?1,?2,?3,?4) ON CONFLICT(crawl_id,ino) DO UPDATE SET path=excluded.path,parent_id=excluded.parent_id",params![crawl.id,ino,path_bytes(&path),crate::paths::directory_id(&index.conn,path.parent().unwrap_or(&path))?])?;
     Ok(())
 }
 
@@ -856,12 +859,12 @@ fn move_directories(index: &mut Index, crawl: i64, old: &Path, new: Option<&Path
             let previous = decode_path(bytes);
             let path = new.join(previous.strip_prefix(old)?);
             tx.execute_cached(
-                "UPDATE btrfs_dirs SET path=?3,parent=?4 WHERE crawl_id=?1 AND ino=?2",
+                "UPDATE btrfs_dirs SET path=?3,parent_id=?4 WHERE crawl_id=?1 AND ino=?2",
                 params![
                     crawl,
                     ino,
                     path_bytes(&path),
-                    path_bytes(path.parent().unwrap())
+                    crate::paths::directory_id(&tx, path.parent().unwrap())?
                 ],
             )?;
         } else {
@@ -882,7 +885,7 @@ fn queue(index: &Index, crawl: i64, ino: u64, directory: bool) -> Result<()> {
 
 fn queue_prefix(index: &Index, crawl: i64, path: &Path) -> Result<()> {
     let (prefix, end) = prefix_bounds(path);
-    index.conn.execute_cached("INSERT OR IGNORE INTO discovery SELECT b.crawl_id,b.ino,0 FROM btrfs_files b JOIN files f ON f.id=b.file_id WHERE b.crawl_id=?1 AND f.path>=?2 AND f.path<?3",params![crawl,prefix,end])?;
+    index.conn.execute_cached("INSERT OR IGNORE INTO discovery SELECT b.crawl_id,b.ino,0 FROM btrfs_files b JOIN files f ON f.id=b.file_id WHERE b.crawl_id=?1 AND f.parent_id IN (SELECT id FROM path_parents WHERE path=?4 OR (path>=?2 AND path<?3))",params![crawl,prefix,end,path_bytes(path)])?;
     Ok(())
 }
 
@@ -1044,6 +1047,7 @@ mod tests {
         fs::write(base.join("f"), vec![1; 12288]).unwrap();
         let options = Options {
             database: dir.path().join("index.sqlite"),
+            storage: crate::storage::Storage::Cow,
             roots: vec![base.clone()],
             chunk_size: 4096,
             granularity,
@@ -1581,7 +1585,7 @@ mod tests {
         let (index, _) = open(&options, &source);
         let path: Vec<u8> = index
             .conn
-            .query_row("SELECT path FROM files", [], |r| r.get(0))
+            .query_row("SELECT path FROM file_paths", [], |r| r.get(0))
             .unwrap();
         assert_eq!(decode_path(path), source.base.join("b/child/f"));
         drop(index);
@@ -1693,9 +1697,11 @@ mod tests {
         let (mut index, _) = open(&options, &source);
         let (ino, bytes): (u64, Vec<u8>) = index
             .conn
-            .query_row("SELECT ino,path FROM files ORDER BY id LIMIT 1", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT ino,path FROM file_paths ORDER BY id LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         fs::rename(decode_path(bytes), source.base.join("renamed")).unwrap();
         source.nodes.get_mut(&ino).unwrap().path = "renamed".into();
