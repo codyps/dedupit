@@ -12,7 +12,7 @@ pkgs.testers.runNixOSTest {
     };
     # Format and populate only the disposable test disk before starting dedupit.
     systemd.services.dedupit.wantedBy = lib.mkForce [ ];
-    environment.systemPackages = [ pkgs.btrfs-progs pkgs.e2fsprogs ];
+    environment.systemPackages = [ pkgs.btrfs-progs pkgs.e2fsprogs pkgs.sqlite ];
   };
   testScript = ''
     import json
@@ -148,6 +148,32 @@ pkgs.testers.runNixOSTest {
         resumed = json.loads(machine.succeed(f"dedupit --database {maintenance_db} --database-storage {storage} --scanner btrfs --granularity file --apply --json {maintenance_root}"))
         assert resumed["bytes_hashed"] == 0, resumed
         assert resumed["errors"] == [], resumed
+
+    # Native inline identities must survive an actual v5 upgrade without reading
+    # file data again, and still detect changes beyond any stored byte prefix.
+    inline_root = "/mnt/fixture/inline-case"
+    inline_db = "/tmp/inline.sqlite"
+    machine.succeed(f"mkdir {inline_root}; printf '%1800s' x > {inline_root}/a; cp --reflink=never {inline_root}/a {inline_root}/b; sync")
+    inline_command = f"dedupit --database {inline_db} --scanner btrfs --granularity both --chunk-size 4096 --json {inline_root}"
+    initial = json.loads(machine.succeed(inline_command))
+    assert initial["duplicate_files"] == 1, initial
+    assert machine.succeed(f"sqlite3 {inline_db} 'SELECT max(length(descriptor)) FROM file_extents'").strip() == "53"
+    # Reconstruct the real v5 duplicated cache and full inline payloads.
+    downgrade = "PRAGMA foreign_keys=OFF; BEGIN; CREATE TABLE chunk_cache_v5(file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,offset INTEGER,length INTEGER,hash BLOB,nonzero INTEGER,PRIMARY KEY(file_id,offset)); INSERT INTO chunk_cache_v5 SELECT * FROM chunk_cache; DROP VIEW chunk_cache; DROP TABLE chunk_cache_extra; DROP TRIGGER invalidate_extent_baseline_range; ALTER TABLE chunk_cache_v5 RENAME TO chunk_cache; CREATE TRIGGER invalidate_extent_baseline AFTER DELETE ON chunk_cache BEGIN DELETE FROM extent_state WHERE file_id=OLD.file_id; END; UPDATE file_extents SET descriptor=CAST(substr(descriptor,1,21)||printf('%1799s',char())||'x' AS BLOB); PRAGMA user_version=5; COMMIT;"
+    import shlex
+    machine.succeed(f"sqlite3 {inline_db} {shlex.quote(downgrade)}")
+    machine.succeed(f"dedupit compact --database {inline_db} --storage cow")
+    resumed = json.loads(machine.succeed(inline_command))
+    assert resumed["bytes_hashed"] == 0, resumed
+    assert resumed["duplicate_files"] == 1, resumed
+    machine.succeed(f"touch {inline_root}/a; sync")
+    metadata_only = json.loads(machine.succeed(inline_command))
+    assert metadata_only["bytes_hashed"] == 0, metadata_only
+    machine.succeed(f"printf y | dd of={inline_root}/a bs=1 seek=1799 conv=notrunc status=none; sync")
+    edited = json.loads(machine.succeed(inline_command))
+    assert edited["bytes_hashed"] == 1800, edited
+    assert edited["duplicate_files"] == 0, edited
+    assert machine.succeed(f"sqlite3 {inline_db} 'SELECT count(*) FROM chunk_cache_extra'").strip() == "0"
 
   '';
 }

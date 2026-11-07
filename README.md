@@ -262,6 +262,23 @@ strings. Upgrades retain file/range IDs, hashes, chunk caches, completed work,
 discovery jobs, and subvolume cursors. Migration is transactional and checks
 foreign keys before committing; interrupted migration rolls back on reopen.
 
+Schema version 6 also consolidates chunk hashes. Candidate chunks use their
+existing `ranges` row as the single source of hash/offset/length data. Only
+non-candidate chunks (zero-filled chunks and file-only mode) need a separate
+`chunk_cache_extra` row. The `chunk_cache` compatibility view exposes both sets
+for chunk-tree hashing and reuse. Existing range IDs, pending flags, completed
+jobs, chunk hashes and extent baselines survive the transactional migration.
+The migration refuses inconsistent duplicated hashes rather than discarding one.
+
+Inline extent descriptors retain their 21-byte Btrfs header and a 32-byte,
+domain-separated BLAKE3 digest of the entire encoded payload. Regular and
+preallocated extent descriptors retain their kernel layout. Migration transforms
+stored inline items using exactly the same encoding as fresh kernel reads, so
+unchanged mappings keep cached hashes reusable. No file contents are read during
+migration. Extent records use a composite primary key without a redundant
+rowid/index pair. The schema version distinguishes legacy raw inline payloads
+from compact descriptors; already compact descriptors are never hashed again.
+
 For an existing index, stop the service and compact it to reclaim the old layout:
 
 ```console

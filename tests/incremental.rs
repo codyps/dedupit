@@ -353,6 +353,12 @@ fn database_hardlink_cannot_bypass_inode_lock() {
 // released versions; changing only user_version would create an invalid fixture.
 fn legacy_paths(conn: &rusqlite::Connection) {
     conn.execute_batch("PRAGMA foreign_keys=OFF; BEGIN;
+      CREATE TABLE chunk_cache_old(file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,offset INTEGER NOT NULL,length INTEGER NOT NULL,hash BLOB NOT NULL,nonzero INTEGER NOT NULL,PRIMARY KEY(file_id,offset));
+      INSERT INTO chunk_cache_old SELECT * FROM chunk_cache;
+      DROP VIEW chunk_cache; DROP TABLE chunk_cache_extra;
+      DROP TRIGGER invalidate_extent_baseline_range;
+      ALTER TABLE chunk_cache_old RENAME TO chunk_cache;
+      CREATE TRIGGER invalidate_extent_baseline AFTER DELETE ON chunk_cache BEGIN DELETE FROM extent_state WHERE file_id=OLD.file_id; END;
       CREATE TABLE files_old(id INTEGER PRIMARY KEY AUTOINCREMENT,path BLOB NOT NULL UNIQUE,dev INTEGER NOT NULL,ino INTEGER NOT NULL,fingerprint BLOB NOT NULL,fskey BLOB NOT NULL,alignment INTEGER NOT NULL,UNIQUE(dev,ino));
       INSERT INTO files_old SELECT id,path,dev,ino,fingerprint,fskey,alignment FROM file_paths;
       CREATE TABLE btrfs_files_old(file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,crawl_id INTEGER REFERENCES crawls(id) ON DELETE CASCADE,ino INTEGER,parent BLOB,UNIQUE(crawl_id,ino));
@@ -384,7 +390,7 @@ fn version_three_upgrade_preserves_hashes_and_completed_jobs() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
             .unwrap(),
-        5
+        6
     );
 }
 
@@ -407,7 +413,7 @@ fn version_one_index_migrates_without_rehashing_portable_files() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        5
+        6
     );
 }
 
@@ -437,11 +443,12 @@ fn old_zero_chunk_candidates_migrate_without_reading_files() {
     put(&options, "nonzero", &vec![42; 4096]);
     let before = run(&options, false).unwrap();
     let conn = rusqlite::Connection::open(&options.database).unwrap();
+    legacy_paths(&conn);
     for length in [4096usize, 17, 511] {
         let hash = blake3::hash(&vec![0; length]);
         conn.execute(
             "INSERT INTO ranges(file_id,kind,offset,length,hash)
-            SELECT id,0,0,?1,?2 FROM file_paths WHERE path=?3",
+            SELECT id,0,0,?1,?2 FROM files WHERE path=?3",
             rusqlite::params![
                 length,
                 hash.as_bytes().as_slice(),
@@ -453,7 +460,6 @@ fn old_zero_chunk_candidates_migrate_without_reading_files() {
         )
         .unwrap();
     }
-    legacy_paths(&conn);
     conn.pragma_update(None, "user_version", 2).unwrap();
     drop(conn);
     let migrated = run(&options, false).unwrap();
@@ -467,7 +473,7 @@ fn old_zero_chunk_candidates_migrate_without_reading_files() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        5
+        6
     );
 }
 

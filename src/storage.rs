@@ -146,8 +146,8 @@ pub fn compact(database: &Path, storage: Storage) -> Result<()> {
     let conn = Connection::open(&database)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     ensure!(
-        (4..=5).contains(&version),
-        "compact supports schema versions 4 and 5"
+        (4..=6).contains(&version),
+        "compact supports schema versions 4 through 6"
     );
     crate::paths::functions(&conn)?;
     conn.execute_batch(
@@ -155,6 +155,9 @@ pub fn compact(database: &Path, storage: Storage) -> Result<()> {
     )?;
     if version < 5 {
         crate::paths::migrate(&conn)?;
+    }
+    if version < 6 {
+        crate::records::migrate(&conn)?;
     }
     let (busy, _, _): (i64, i64, i64) =
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {

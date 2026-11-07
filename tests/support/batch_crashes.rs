@@ -66,6 +66,7 @@ fn durable_state(database: &Path) -> (Value, blake3::Hash) {
         "path_parents",
         "ranges",
         "chunk_cache",
+        "chunk_cache_extra",
         "file_extents",
         "extent_state",
         "apply_mappings",
@@ -81,7 +82,10 @@ fn durable_state(database: &Path) -> (Value, blake3::Hash) {
         let mut statement = conn
             .prepare(&format!(
                 "SELECT * FROM {table} ORDER BY {}",
-                if table == "btrfs_dirs" {
+                if table == "chunk_cache" || table == "chunk_cache_extra" || table == "file_extents"
+                {
+                    "file_id,offset"
+                } else if table == "btrfs_dirs" {
                     "crawl_id,ino"
                 } else {
                     "rowid"

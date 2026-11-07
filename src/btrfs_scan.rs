@@ -73,7 +73,7 @@ pub(crate) fn refresh_apply_mapping(
             .map(|e| Extent {
                 offset: e.offset,
                 length: e.length,
-                descriptor: e.descriptor,
+                descriptor: crate::records::descriptor(&e.descriptor),
             })
             .collect();
         ensure!(
@@ -680,7 +680,16 @@ fn file_job_at(
         .inode(&crawl.file, ino)?
         .context("inode disappeared")?;
     ensure!(inode.regular(), "inode is no longer a regular file");
-    let extents = source.extents(&crawl.file, ino)?;
+    let extents = source
+        .extents(&crawl.file, ino)?
+        .into_iter()
+        .map(|mut extent| {
+            if extent.descriptor.get(20) == Some(&0) {
+                extent.descriptor = crate::records::descriptor(&extent.descriptor);
+            }
+            extent
+        })
+        .collect();
     ensure!(
         scan::fingerprint(&file.metadata()?) == fingerprint,
         "file changed during extent enumeration"

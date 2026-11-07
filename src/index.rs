@@ -254,7 +254,7 @@ impl Index {
         conn.execute_batch("PRAGMA journal_size_limit=67108864;")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            (0..=5).contains(&version),
+            (0..=6).contains(&version),
             "unsupported index schema version {version}"
         );
         if version < 5 {
@@ -415,6 +415,9 @@ impl Index {
         }
         if version < 5 {
             crate::paths::migrate(&conn)?;
+        }
+        if version < 6 {
+            crate::records::migrate(&conn)?;
         }
         // A process or machine crash may have preserved SQLite's provisional
         // maps but lost btrfs's transaction. Revisit them even if that rollback

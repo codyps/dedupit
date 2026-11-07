@@ -12,6 +12,7 @@ mod btrfs_scan;
 mod failpoints;
 mod index;
 mod paths;
+mod records;
 #[cfg(target_os = "linux")]
 mod savings;
 mod scan;

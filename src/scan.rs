@@ -494,7 +494,7 @@ fn index_file_inner(
     };
     if full {
         tx.execute_cached("DELETE FROM ranges WHERE file_id=?1", [file_id])?;
-        tx.execute_cached("DELETE FROM chunk_cache WHERE file_id=?1", [file_id])?;
+        tx.execute_cached("DELETE FROM chunk_cache_extra WHERE file_id=?1", [file_id])?;
     } else {
         for (start, end) in &dirty {
             tx.execute_cached(
@@ -502,7 +502,7 @@ fn index_file_inner(
                 params![file_id, start, end],
             )?;
             tx.execute_cached(
-                "DELETE FROM chunk_cache WHERE file_id=?1 AND offset>=?2 AND offset<?3",
+                "DELETE FROM chunk_cache_extra WHERE file_id=?1 AND offset>=?2 AND offset<?3",
                 params![file_id, start, end],
             )?;
         }
@@ -511,7 +511,7 @@ fn index_file_inner(
             params![file_id, before.len()],
         )?;
         tx.execute_cached(
-            "DELETE FROM chunk_cache WHERE file_id=?1 AND offset>=?2",
+            "DELETE FROM chunk_cache_extra WHERE file_id=?1 AND offset>=?2",
             params![file_id, before.len()],
         )?;
         stats.chunks_reused += tx.query_row_cached(
@@ -540,7 +540,7 @@ fn index_file_inner(
         "INSERT INTO ranges(file_id,kind,offset,length,hash) VALUES (?1,?2,?3,?4,?5)",
     )?;
     let mut cache = tx.prepare_cached(
-        "INSERT INTO chunk_cache(file_id,offset,length,hash,nonzero) VALUES (?1,?2,?3,?4,?5)",
+        "INSERT INTO chunk_cache_extra(file_id,offset,length,hash,nonzero) VALUES (?1,?2,?3,?4,?5)",
     )?;
     for (start, end) in &dirty {
         let mut offset = *start;
@@ -582,16 +582,8 @@ fn index_file_inner(
             stats.bytes_hashed += length as u64;
             let hash = blake3::hash(&buffer[..length]);
             let nonzero = buffer[..length].iter().any(|byte| *byte != 0);
-            cache.execute(params![
-                file_id,
-                offset,
-                length as u64,
-                hash.as_bytes().as_slice(),
-                nonzero
-            ])?;
-            // Holes and allocated zeroes are the same logical data. Dedupe can
-            // change their physical representation without changing timestamps;
-            // omit both from chunk candidates, just as whole-file hashes do.
+            // Candidate ranges are also the canonical chunk cache. Retain a
+            // separate row only for chunks which cannot be candidates.
             if nonzero && options.granularity != Granularity::File {
                 insert.execute(params![
                     file_id,
@@ -599,6 +591,14 @@ fn index_file_inner(
                     offset,
                     length as u64,
                     hash.as_bytes().as_slice()
+                ])?;
+            } else {
+                cache.execute(params![
+                    file_id,
+                    offset,
+                    length as u64,
+                    hash.as_bytes().as_slice(),
+                    nonzero
                 ])?;
             }
             offset += length as u64;
@@ -833,6 +833,35 @@ fn next_data(file: &File, offset: u64) -> io::Result<Option<u64>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compact_inline_maps_reuse_unchanged_chunks_but_detect_payload_edits() {
+        let mut raw = vec![0; 21];
+        raw.extend_from_slice(&vec![7; 1800]);
+        let old = Extent {
+            offset: 0,
+            length: 1800,
+            descriptor: crate::records::descriptor(&raw),
+        };
+        let same = Extent {
+            offset: 0,
+            length: 1800,
+            descriptor: crate::records::descriptor(&raw),
+        };
+        assert!(
+            super::dirty_ranges(std::slice::from_ref(&old), &[same], 1800, 1800, 4096).is_empty()
+        );
+        *raw.last_mut().unwrap() = 8;
+        let changed = Extent {
+            offset: 0,
+            length: 1800,
+            descriptor: crate::records::descriptor(&raw),
+        };
+        assert_eq!(
+            super::dirty_ranges(&[old], &[changed], 1800, 1800, 4096),
+            vec![(0, 1800)]
+        );
+    }
+
     use super::*;
     use std::os::unix::{ffi::OsStringExt, fs::symlink};
 
