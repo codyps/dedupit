@@ -163,7 +163,10 @@ as hardlinked `filesystem-status-legacy-TIMESTAMP.json` archives during migratio
 Expected read-only destinations count as `Read-only skips` (`readonly_ranges`)
 rather than adding one error string per rejected range. They remain pending for
 a later run in case the subvolume becomes writable; their read-only flags stay
-intact. Unexpected I/O failures remain errors.
+intact. When a match is read-only, dedupit reverses the direction and uses it
+as the donor for earlier writable copies, including already completed matches.
+Later writable copies prefer that donor. This works in either indexing order;
+two read-only copies cannot be merged. Unexpected I/O failures remain errors.
 
 A crash or forced kill can leave the latest status stale; `stats` shows its age.
 Reports use atomic replacement. Fatal scan failures and busy files are logged

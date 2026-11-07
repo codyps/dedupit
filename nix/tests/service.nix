@@ -97,17 +97,42 @@ pkgs.testers.runNixOSTest {
     machine.succeed("cmp /mnt/fixture/mixed/nocow/a /mnt/fixture/mixed/cow/b")
     machine.succeed("lsattr /mnt/fixture/mixed/nocow/a | grep -q C")
     machine.fail("lsattr /mnt/fixture/mixed/cow/a | cut -d ' ' -f1 | grep -q C")
-    machine.succeed("mkdir -p /mnt/fixture/readonly-case")
-    machine.succeed("dd if=/dev/urandom of=/mnt/fixture/readonly-case/source bs=4096 count=16 status=none")
-    machine.succeed("btrfs subvolume create /mnt/fixture/readonly-case/readonly")
-    machine.succeed("cp --reflink=never /mnt/fixture/readonly-case/source /mnt/fixture/readonly-case/readonly/copy && sync")
-    machine.succeed("btrfs property set -t s /mnt/fixture/readonly-case/readonly ro true")
-    readonly = json.loads(machine.succeed("dedupit --database /tmp/readonly.sqlite --scanner btrfs --granularity file --apply --json /mnt/fixture/readonly-case"))
-    assert readonly["errors"] == [], readonly
-    assert readonly["readonly_ranges"] >= 1, readonly
-    machine.succeed("cmp /mnt/fixture/readonly-case/source /mnt/fixture/readonly-case/readonly/copy")
-    machine.succeed("btrfs property get -t s /mnt/fixture/readonly-case/readonly ro | grep -q 'ro=true'")
+    # Index in an explicit order, then apply. All writable copies must converge
+    # on the immutable donor even when some were already deduplicated earlier.
+    for readonly_first in [False, True]:
+        case = "/mnt/fixture/readonly-" + str(readonly_first)
+        db = "/tmp/readonly-" + str(readonly_first) + ".sqlite"
+        machine.succeed(f"mkdir -p {case}")
+        if not readonly_first:
+            machine.succeed(f"dd if=/dev/urandom of={case}/a bs=4096 count=16 status=none; cp --reflink=never {case}/a {case}/b; sync")
+            machine.succeed(f"dedupit --database {db} --scanner btrfs --granularity file --apply --json {case}")
+            machine.succeed(f"btrfs subvolume create {case}/readonly; cp --reflink=never {case}/a {case}/readonly/copy; sync; btrfs property set -t s {case}/readonly ro true")
+        else:
+            machine.succeed(f"btrfs subvolume create {case}/readonly; dd if=/dev/urandom of={case}/readonly/copy bs=4096 count=16 status=none; btrfs property set -t s {case}/readonly ro true")
+            machine.succeed(f"dedupit --database {db} --scanner btrfs --granularity file --json {case}")
+            machine.succeed(f"cp --reflink=never {case}/readonly/copy {case}/a; cp --reflink=never {case}/a {case}/b; sync")
+        readonly = json.loads(machine.succeed(f"dedupit --database {db} --scanner btrfs --granularity file --apply --json {case}"))
+        assert readonly["errors"] == [], readonly
+        assert readonly["jobs_completed"] >= 2, readonly
+        machine.succeed(f"cmp {case}/a {case}/readonly/copy; cmp {case}/b {case}/readonly/copy")
+        machine.succeed(f"btrfs property get -t s {case}/readonly ro | grep -q 'ro=true'")
+        # FIEMAP exposes the actual shared physical allocation, independently of
+        # counters or comparisons of file contents.
+        mappings = machine.succeed(f"filefrag -v {case}/a {case}/b {case}/readonly/copy")
+        extents = [line.split()[3] for line in mappings.splitlines() if line.strip().startswith("0:")]
+        assert len(extents) == 3 and len(set(extents)) == 1, mappings
+        again = json.loads(machine.succeed(f"dedupit --database {db} --scanner btrfs --granularity file --apply --json {case}"))
+        assert again["errors"] == [], again
 
+    # A read-only copy in another checksum class must never become that class's
+    # cached donor. In particular, repeated scans must terminate without EINVAL.
+    machine.succeed("mkdir -p /mnt/fixture/readonly-policy; btrfs subvolume create /mnt/fixture/readonly-policy/ro")
+    machine.succeed("chattr +C /mnt/fixture/readonly-policy/ro; dd if=/dev/urandom of=/mnt/fixture/readonly-policy/ro/copy bs=4096 count=16 status=none")
+    machine.succeed("cp --reflink=never /mnt/fixture/readonly-policy/ro/copy /mnt/fixture/readonly-policy/a; btrfs property set -t s /mnt/fixture/readonly-policy/ro ro true; sync")
+    for _ in range(2):
+        policy = json.loads(machine.succeed("timeout 30 dedupit --database /tmp/readonly-policy.sqlite --scanner btrfs --granularity file --apply --json /mnt/fixture/readonly-policy"))
+        assert policy["errors"] == [], policy
+        assert policy["bytes_deduped"] == 0, policy
 
   '';
 }

@@ -762,6 +762,16 @@ impl Index {
         backend: &mut dyn Backend,
         stats: &mut Stats,
     ) -> Result<()> {
+        self.apply_target_from(target, backend, stats, None)
+    }
+
+    fn apply_target_from(
+        &mut self,
+        target: &Job,
+        backend: &mut dyn Backend,
+        stats: &mut Stats,
+        forced_source: Option<i64>,
+    ) -> Result<()> {
         let mut target_policy: Option<u64> = self
             .conn
             .query_row_cached(
@@ -770,18 +780,25 @@ impl Index {
                 |r| r.get(0),
             )
             .optional()?;
-        let mut expected = target_policy
-            .map(|policy| self.class_source(target, policy))
-            .transpose()?
-            .flatten()
-            .filter(|id| *id < target.id);
+        let mut expected = forced_source
+            .or(target_policy
+                .map(|policy| self.class_source(target, policy))
+                .transpose()?
+                .flatten())
+            .filter(|id| *id != target.id);
         let mut cursor = expected.map_or(0, |id| id - 1);
         let mut found = false;
         loop {
-            // Deterministic lowest-ID representative, not all O(n^2) pairs.
+            // Prefer a cached read-only donor; otherwise use the lowest ID.
+            // Keep a single representative rather than all O(n^2) pairs.
             // Seek to another source when a representative is stale. Hash
             // lookup and keyset iteration use the matches index.
-            let source = self
+            let source = if let Some(id) = expected.or(forced_source) {
+                self.conn
+                    .query_row_cached(&format!("{JOB_SELECT} WHERE r.id=?1"), [id], Job::from_row)
+                    .optional()?
+            } else {
+                self
                 .conn
                 .query_row_cached(
                     &format!(
@@ -802,11 +819,15 @@ impl Index {
                     ],
                     Job::from_row,
                 )
-                .optional()?;
+                .optional()?
+            };
             if let Some(cached) = expected.take() {
                 if source.as_ref().map(|source| source.id) != Some(cached) {
                     if let Some(policy) = target_policy {
                         self.forget_class_source(target, policy)?;
+                    }
+                    if forced_source.is_some() {
+                        return Ok(());
                     }
                     cursor = 0;
                     continue;
@@ -850,6 +871,9 @@ impl Index {
                 // Do not walk every member of a large unready duplicate group.
                 return Ok(());
             }
+            if forced_source.is_some() && found {
+                return Ok(());
+            }
             found = true;
             cursor = source.id;
             if source.file_id == target.file_id
@@ -876,6 +900,45 @@ impl Index {
                         .is_some_and(|e| e.raw_os_error() == Some(libc::EROFS))
                     {
                         stats.readonly_ranges += 1;
+                        if forced_source.is_none() {
+                            // A later read-only match can donate to every earlier
+                            // writable member, including already completed jobs.
+                            // Use the normal validation, policy, and completion path.
+                            let policy =
+                                self.policy(target.file_id, &target.open(false)?, backend)?;
+                            // An existing read-only donor is already the best
+                            // representative; two immutable copies cannot merge.
+                            if self.policy(source.file_id, &source_file, backend)? == policy
+                                && source.open(true).is_err_and(|e| {
+                                    e.downcast_ref::<std::io::Error>()
+                                        .is_some_and(|e| e.raw_os_error() == Some(libc::EROFS))
+                                })
+                            {
+                                if let Some(policy) = policy {
+                                    self.remember_class_source(target, policy, source.id)?;
+                                }
+                                return Ok(());
+                            }
+                            let mut cursor = 0;
+                            loop {
+                                self.progress(stats)?;
+                                let candidate = self.conn.query_row_cached(
+                                    &format!("{JOB_SELECT} WHERE r.kind=?1 AND r.hash=?2 AND r.length=?3 AND f.fskey=?4 AND r.id>?5 AND r.id<?6 AND ({ready}) ORDER BY r.id LIMIT 1", ready=self.ready()),
+                                    params![target.kind,target.hash,target.len,target.fskey,cursor,target.id], Job::from_row,
+                                ).optional()?;
+                                let Some(candidate) = candidate else { break };
+                                cursor = candidate.id;
+                                self.apply_target_from(
+                                    &candidate,
+                                    backend,
+                                    stats,
+                                    Some(target.id),
+                                )?;
+                            }
+                            if let Some(policy) = policy {
+                                self.remember_class_source(target, policy, target.id)?;
+                            }
+                        }
                         return Ok(());
                     }
                     // Permission errors must remain retryable; only invalidate
