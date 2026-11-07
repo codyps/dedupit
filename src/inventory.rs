@@ -166,6 +166,10 @@ impl Worker {
                 if worker_stop.load(Ordering::Relaxed) {
                     break;
                 }
+                // The scanner may already be idle when the last inventory
+                // reader releases its snapshot. Do not wait an hour for its
+                // next write to reclaim the WAL's retained allocation.
+                let _ = checkpoint(&directory);
                 match outcome {
                     Ok(()) if report.refresh.verified_files == 0 => {
                         report.state = "Waiting for verified native extent mappings".into();
@@ -214,6 +218,19 @@ impl Drop for Worker {
             let _ = thread.join();
         }
     }
+}
+
+fn checkpoint(directory: &Path) -> Result<()> {
+    let connection = Connection::open_with_flags(
+        directory.join("filesystem.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )?;
+    // A live writer/reader is allowed to defer this attempt. SQLite's locks
+    // coordinate checkpoints; no scan rows or durable progress are modified.
+    connection.busy_timeout(Duration::ZERO)?;
+    connection.execute_batch("PRAGMA journal_size_limit=67108864;")?;
+    let _: i64 = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+    Ok(())
 }
 
 fn capture(connection: &Connection) -> Result<()> {
@@ -269,6 +286,7 @@ fn refresh(
     // Slow filesystem validation and sorting use TEMP exclusively. Inline file
     // contents are not needed: all decoded extent fields fit in 53 bytes.
     capture(&connection)?;
+    let _ = checkpoint(directory);
     report.state = "Verifying indexed files".into();
     write(directory, report)?;
     let mut last_report = Instant::now();
@@ -487,7 +505,7 @@ mod checkpoint_tests {
     #[test]
     fn materialized_inventory_survives_source_changes_without_pinning_wal() {
         let directory = tempfile::tempdir().unwrap();
-        let db = directory.path().join("index.sqlite");
+        let db = directory.path().join("filesystem.sqlite");
         let writer = Connection::open(&db).unwrap();
         writer.execute_batch("PRAGMA journal_mode=WAL;
           CREATE TABLE files(id INTEGER PRIMARY KEY,path BLOB,fingerprint BLOB,fskey BLOB);
@@ -506,11 +524,12 @@ mod checkpoint_tests {
         writer
             .execute_batch("UPDATE files SET fingerprint=x'ff'; DELETE FROM file_extents;")
             .unwrap();
-        let busy: i64 = writer
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))
-            .unwrap();
+        checkpoint(directory.path()).unwrap();
         assert_eq!(
-            busy, 0,
+            fs::metadata(directory.path().join("filesystem.sqlite-wal"))
+                .unwrap()
+                .len(),
+            0,
             "inventory must release the main WAL before slow validation/sorting"
         );
         assert_eq!(
