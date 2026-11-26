@@ -275,6 +275,7 @@ impl Index {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA journal_size_limit=67108864;",
         )?;
         crate::schema::migrate(&conn, 0)?;
+        crate::paths::functions(&conn)?;
         conn.execute_batch(
             "CREATE TEMP TABLE seen (file_id INTEGER PRIMARY KEY);
              CREATE TEMP TABLE apply_failed (id INTEGER PRIMARY KEY);
@@ -1118,6 +1119,38 @@ impl Job {
 mod tests {
     use super::*;
     use rusqlite::StatementStatus;
+
+    #[test]
+    fn cleanup_can_remove_a_file_after_reopening_the_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap().join("data");
+        fs::create_dir(&root).unwrap();
+        let stale = root.join("stale");
+        let kept = root.join("kept");
+        fs::write(&stale, b"stale").unwrap();
+        fs::write(&kept, b"keep").unwrap();
+        let options = Options {
+            database: temp.path().join("index.sqlite"),
+            roots: vec![root],
+            chunk_size: 4096,
+            granularity: Granularity::Both,
+            verify: false,
+            scanner: crate::Scanner::Portable,
+            commit_batch_size: 64,
+            storage: crate::storage::Storage::Cow,
+        };
+        crate::run(&options, false).unwrap();
+
+        let mut reopened = Index::open(&options).unwrap();
+        reopened.discard_file(&stale).unwrap();
+        let remaining: (u64, Vec<u8>) = reopened
+            .conn
+            .query_row("SELECT count(*), min(path) FROM file_paths", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(remaining, (1, path_bytes(&kept).to_vec()));
+    }
 
     #[test]
     fn listing_uses_index_order_without_sorting_paths() {
