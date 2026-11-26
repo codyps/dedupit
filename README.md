@@ -77,15 +77,19 @@ Normal stats read small snapshots; `--errors` streams detailed error logs.
 Only one service can own a state directory. Preserve it across reboots,
 including on systems with ephemeral roots.
 
-Stats distinguish current sharing estimates from cumulative activity:
-
-- **Current sharing** covers verified indexed files and includes existing
-  reflinks, snapshots, and sharing by other tools. It catches up as scanning
-  and reconciliation progress; it is not a whole-volume free-space measurement.
-- **Physical estimate** accounts for encoded allocation sizes within its shown
-  coverage, excluding metadata and RAID overhead.
-- **Dedupe accepted** counts logical bytes accepted by sharing operations.
-  Repeated work may count again; this is not current space saved.
+- **Space saved across measured files** includes existing reflinks, snapshots,
+  and sharing by other tools. The on-disk estimate accounts for compression
+  within the amount of referenced data shown under it. Metadata and RAID overhead
+  are outside its scope.
+- **Files measured** gives the number and combined file sizes of files that
+  contributed to the estimate. Dedupit measures sharing using Btrfs extent
+  mappings it has checked against current files. The index can contain other
+  files, and the total number of files on the volume is unknown.
+- **Queued work** shows scan entries for files and directories, file updates
+  (including removals), and disk allocations whose sharing totals need updating.
+  The counts can overlap and grow as more files are found.
+- **Scan activity** counts operations. Logical bytes shared may include
+  repeated work across scans.
 
 ## NixOS
 

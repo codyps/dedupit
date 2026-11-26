@@ -718,6 +718,92 @@ fn database_size(directory: &Path) -> Result<Option<DatabaseSize>> {
     }))
 }
 
+fn print_sharing_inventory(inventory: Option<&crate::inventory::Report>) {
+    println!("\nSpace saved across measured files");
+    let Some(inventory) = inventory else {
+        println!("  Waiting for the first sharing measurement.");
+        return;
+    };
+    let current_time = now();
+    let refresh = &inventory.refresh;
+    // A published estimate and an in-progress refresh can describe different
+    // sets of files. Keep each estimate paired with the counts it was based on.
+    let estimate = inventory
+        .estimate
+        .as_ref()
+        .or_else(|| (refresh.verified_files > 0).then_some(refresh));
+    if let Some(estimate) = estimate {
+        let physical = if estimate.physical_covered_bytes > 0 {
+            size(estimate.physical_estimate_bytes)
+        } else {
+            "Unavailable".into()
+        };
+        println!("  On disk (estimated)                {physical}");
+        if estimate.physical_covered_bytes > 0 && estimate.referenced_data_bytes > 0 {
+            println!(
+                "    Calculated from {} out of {} referenced by these files.",
+                size(estimate.physical_covered_bytes),
+                size(estimate.referenced_data_bytes)
+            );
+        }
+        println!(
+            "  Before compression                 {}",
+            size(estimate.saved_uncompressed_bytes)
+        );
+        if estimate.as_of > 0 {
+            println!(
+                "  Measured                           {} ago",
+                elapsed(current_time.saturating_sub(estimate.as_of))
+            );
+        }
+
+        println!("\nFiles measured");
+        println!(
+            "  Sharing measured for {} of the {} files in the index.",
+            count(estimate.verified_files),
+            count(estimate.indexed_files)
+        );
+        println!(
+            "  Combined file size is {}.",
+            size(estimate.checked_file_bytes)
+        );
+    } else {
+        println!("  Waiting for the first sharing measurement.");
+    }
+
+    println!("\nQueued work");
+    if refresh.as_of > 0 {
+        println!(
+            "  Counts updated                     {} ago",
+            elapsed(current_time.saturating_sub(refresh.as_of))
+        );
+    }
+    if refresh.as_of > 0 || refresh.incremental {
+        println!(
+            "  Files and directories to scan      {}",
+            count(refresh.pending_jobs)
+        );
+    } else {
+        println!("  Waiting for queue counts.");
+    }
+    if refresh.incremental {
+        println!(
+            "  File updates to process            {} (includes removals)",
+            count(refresh.pending_files)
+        );
+        println!(
+            "  Disk allocations to recalculate    {}",
+            count(refresh.pending_groups)
+        );
+        if !refresh.bootstrap_complete {
+            println!("  The first check of indexed files is still in progress.");
+        }
+    }
+    if let Some(error) = &inventory.error {
+        println!("  Sharing refresh error              {error}");
+    }
+}
+
 pub fn stats(args: StatsArgs) -> Result<()> {
     let status =
         read_optional::<serde_json::Value>(&args.state_directory.join("filesystem-status.json"))?;
@@ -803,84 +889,12 @@ pub fn stats(args: StatsArgs) -> Result<()> {
     } else {
         println!("  Database     Not created yet");
     }
-    println!("\nCurrent sharing estimate (indexed files)");
-    if let Some(inventory) = &inventory {
-        let best = inventory
-            .estimate
-            .as_ref()
-            .or_else(|| (inventory.refresh.mapped_data_bytes > 0).then_some(&inventory.refresh));
-        if let Some(best) = best {
-            println!(
-                "  Saved (uncompressed)   {}",
-                size(best.saved_uncompressed_bytes)
-            );
-            println!(
-                "  Physical estimate      {}",
-                if best.physical_covered_bytes > 0 {
-                    size(best.physical_estimate_bytes)
-                } else {
-                    "-".into()
-                }
-            );
-            let pct = if best.referenced_data_bytes == 0 {
-                0.0
-            } else {
-                best.physical_covered_bytes as f64 / best.referenced_data_bytes as f64 * 100.0
-            };
-            println!(
-                "    Coverage             {} / {} ({pct:.1}%)",
-                size(best.physical_covered_bytes),
-                size(best.referenced_data_bytes)
-            );
-            println!(
-                "  Based on               {} / {} indexed files · {} checked · {} ago",
-                count(best.verified_files),
-                count(best.indexed_files),
-                size(best.checked_file_bytes),
-                elapsed(now().saturating_sub(best.as_of))
-            );
-            println!(
-                "  Index reconciliation   {} queued jobs",
-                count(best.pending_jobs)
-            );
-        }
-        if inventory.refresh.incremental {
-            println!(
-                "  Inventory               {} · {} file updates · {} processed",
-                if inventory.refresh.bootstrap_complete {
-                    "incremental"
-                } else {
-                    "bootstrapping"
-                },
-                count(inventory.refresh.changed_files),
-                size(inventory.refresh.changed_file_bytes)
-            );
-            println!(
-                "    Pending              {} files · {} allocation groups",
-                count(inventory.refresh.pending_files),
-                count(inventory.refresh.pending_groups)
-            );
-        } else if inventory.state != "Complete" {
-            println!(
-                "  {}: {} / {} indexed files · {} checked · {} extent data examined",
-                inventory.state,
-                count(inventory.refresh.checked_files),
-                count(inventory.refresh.indexed_files),
-                size(inventory.refresh.checked_file_bytes),
-                size(inventory.refresh.mapped_data_bytes)
-            );
-        }
-        if let Some(error) = &inventory.error {
-            println!("  Inventory error        {error}");
-        }
-    } else {
-        println!("  Inventory starting");
-    }
-    println!("\nDedupit activity history");
+    print_sharing_inventory(inventory.as_ref());
+    println!("\nScan activity (operation counts)");
     println!();
     println!(
         "  {:<22} {:>17} {:>17} {:>17}",
-        "", "This scan", "Last complete", "Recorded work"
+        "", "Latest scan", "Last complete", "Recorded work"
     );
     let row = |label: &str, a: Option<u64>, b: Option<u64>, c: Option<u64>, bytes: bool| {
         let value = |n: Option<u64>| {
@@ -916,7 +930,7 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         true,
     );
     row(
-        "Dedupe accepted",
+        "Logical bytes shared",
         progress.as_ref().map(|s| s.bytes_deduped),
         result.as_ref().map(|s| s.bytes_deduped),
         Some(activity.bytes_deduped),

@@ -238,3 +238,67 @@ fn normal_stats_reads_small_summaries_and_only_explicit_errors_reads_the_log() {
         .unwrap()
         .contains("second detail"));
 }
+
+#[test]
+fn stats_pairs_savings_with_measured_files_and_shows_newer_queues() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("filesystem-status.json"),
+        r#"{"state":"running","progress":{"bytes_deduped":1024}}"#,
+    )
+    .unwrap();
+    let inventory = serde_json::json!({
+        "state": "Bootstrapping incremental inventory",
+        "estimate": {
+            "as_of": 1,
+            "verified_files": 658,
+            "indexed_files": 1000,
+            "checked_file_bytes": 8192,
+            "physical_covered_bytes": 4096,
+            "referenced_data_bytes": 8192,
+            "physical_estimate_bytes": 2048,
+            "saved_uncompressed_bytes": 4096,
+            "pending_jobs": 987,
+        },
+        "refresh": {
+            "as_of": 2,
+            "incremental": true,
+            "verified_files": 100,
+            "indexed_files": 2000,
+            "pending_jobs": 765,
+            "pending_files": 321,
+            "pending_groups": 12,
+        }
+    });
+    fs::write(
+        directory.path().join("sharing-inventory.json"),
+        inventory.to_string(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_dedupit"))
+        .args(["stats", "--state-directory"])
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for expected in [
+        "On disk (estimated) 2.00 KiB",
+        "Calculated from 4.00 KiB out of 8.00 KiB referenced by these files.",
+        "Before compression 4.00 KiB",
+        "Sharing measured for 658 of the 1,000 files in the index.",
+        "Combined file size is 8.00 KiB.",
+        "Files and directories to scan 765",
+        "File updates to process 321 (includes removals)",
+        "Disk allocations to recalculate 12",
+        "The first check of indexed files is still in progress.",
+        "Logical bytes shared 1.00 KiB",
+    ] {
+        assert!(
+            normalized.contains(expected),
+            "{expected:?} missing from {text}"
+        );
+    }
+    assert!(!normalized.contains("Files and directories to scan 987"));
+}
