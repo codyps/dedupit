@@ -88,9 +88,17 @@ pub(crate) fn repair_file_queue(tx: &Transaction<'_>) -> Result<()> {
     }
     tx.execute_batch(
         "ALTER TABLE inventory_progress ADD COLUMN dirty_files INTEGER NOT NULL DEFAULT 0;
-         ALTER TABLE inventory_progress ADD COLUMN dirty_groups INTEGER NOT NULL DEFAULT 0;
-         DROP TABLE inventory_dirty;
-         DELETE FROM inventory_groups WHERE (fskey,physical) IN
+         ALTER TABLE inventory_progress ADD COLUMN dirty_groups INTEGER NOT NULL DEFAULT 0;",
+    )?;
+    // The old queue contains only numeric IDs and retry state. Reclaim its
+    // pages without rewriting each one on SQLite builds with secure deletion.
+    let secure_delete: i64 = tx.pragma_query_value(None, "secure_delete", |row| row.get(0))?;
+    tx.pragma_update(None, "secure_delete", 0)?;
+    let drop_queue = tx.execute_batch("DROP TABLE inventory_dirty;");
+    tx.pragma_update(None, "secure_delete", secure_delete)?;
+    drop_queue?;
+    tx.execute_batch(
+        "DELETE FROM inventory_groups WHERE (fskey,physical) IN
            (SELECT fskey,physical FROM inventory_dirty_groups);
          UPDATE inventory_progress SET cursor=0,ceiling=(SELECT coalesce(max(id),0) FROM files),
            dirty_groups=(SELECT count(*) FROM inventory_dirty_groups) WHERE id=1;",
@@ -191,7 +199,13 @@ mod tests {
         )
         .unwrap();
 
+        conn.pragma_update(None, "secure_delete", 1).unwrap();
         crate::schema::migrate(&conn, 7).unwrap();
+        assert_eq!(
+            conn.pragma_query_value(None, "secure_delete", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
         let counts = || {
             conn.query_row(
                 "SELECT dirty_files, (SELECT count(*) FROM inventory_dirty),
