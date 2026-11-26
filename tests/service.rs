@@ -218,9 +218,9 @@ fn normal_stats_reads_small_summaries_and_only_explicit_errors_reads_the_log() {
         "{}",
         String::from_utf8_lossy(&human.stderr)
     );
-    assert!(String::from_utf8(human.stdout)
-        .unwrap()
-        .contains("1,000,000"));
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("1,000,000"));
+    assert!(human.contains("File errors from the latest scan"));
     let json = invoke(&["--json"]);
     assert!(json.status.success());
     let json: Value = serde_json::from_slice(&json.stdout).unwrap();
@@ -234,9 +234,39 @@ fn normal_stats_reads_small_summaries_and_only_explicit_errors_reads_the_log() {
     .unwrap();
     let details = invoke(&["--errors"]);
     assert!(details.status.success());
-    assert!(String::from_utf8(details.stdout)
-        .unwrap()
-        .contains("second detail"));
+    let details = String::from_utf8(details.stdout).unwrap();
+    assert!(details.contains("File errors from the latest scan"));
+    assert!(details.contains("second detail"));
+
+    fs::write(
+        directory.path().join("filesystem-status.json"),
+        r#"{"state":"running","progress":{"files_seen":123}}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("filesystem-result-summary.json"),
+        r#"{"errors":["older error preview"],"errors_total":2}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("filesystem-result.json"),
+        r#"{"errors":["older error preview","older error detail"]}"#,
+    )
+    .unwrap();
+
+    let human = invoke(&[]);
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("File errors from the last completed scan"));
+    assert!(human.contains("older error preview"));
+    assert!(!human.contains("older error detail"));
+
+    let details = invoke(&["--errors"]);
+    assert!(details.status.success());
+    let details = String::from_utf8(details.stdout).unwrap();
+    assert!(details.contains("File errors from the last completed scan"));
+    assert!(details.contains("older error detail"));
+    assert!(!details.contains("second detail"));
 }
 
 #[test]

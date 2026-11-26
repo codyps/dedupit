@@ -1010,52 +1010,58 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         );
     }
     let current_errors = progress.as_ref().is_some_and(|s| s.error_count() > 0);
-    if args.errors {
-        println!("\n  File errors");
-        if current_errors {
-            match File::open(args.state_directory.join("filesystem-errors.jsonl")) {
-                Ok(file) => {
-                    let mut output = BufWriter::new(io::stdout().lock());
-                    for line in BufReader::with_capacity(64 * 1024, file).lines() {
-                        let error: String = serde_json::from_str(&line?)?;
-                        writeln!(output, "  {error}")?;
-                    }
-                    output.flush()?;
+    let completed_details = if args.errors && !current_errors {
+        read_optional::<Stats>(&args.state_directory.join("filesystem-result.json"))?
+    } else {
+        None
+    };
+    let (heading, report) = if current_errors {
+        ("File errors from the latest scan", progress.as_ref())
+    } else {
+        (
+            "File errors from the last completed scan",
+            completed_details.as_ref().or(result.as_ref()),
+        )
+    };
+    let Some(report) = report.filter(|s| s.error_count() > 0) else {
+        if args.errors {
+            println!("\n  No recorded file errors");
+        }
+        return Ok(());
+    };
+
+    println!("\n  {heading}");
+    if !args.errors {
+        for error in report.errors.iter().take(10) {
+            println!("    {error}");
+        }
+        let shown = report.errors.len().min(10) as u64;
+        if report.error_count() > shown {
+            println!(
+                "    … {} more (use --errors for full details)",
+                count(report.error_count() - shown)
+            );
+        }
+    } else if current_errors {
+        match File::open(args.state_directory.join("filesystem-errors.jsonl")) {
+            Ok(file) => {
+                let mut output = BufWriter::new(io::stdout().lock());
+                for line in BufReader::with_capacity(64 * 1024, file).lines() {
+                    let error: String = serde_json::from_str(&line?)?;
+                    writeln!(output, "  {error}")?;
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    if let Some(stats) = &progress {
-                        for error in &stats.errors {
-                            println!("  {error}");
-                        }
-                    }
+                output.flush()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                for error in &report.errors {
+                    println!("  {error}");
                 }
-                Err(error) => return Err(error.into()),
             }
-        } else if let Some(full) =
-            read_optional::<Stats>(&args.state_directory.join("filesystem-result.json"))?
-        {
-            for error in &full.errors {
-                println!("  {error}");
-            }
+            Err(error) => return Err(error.into()),
         }
     } else {
-        let report = if current_errors {
-            progress.as_ref()
-        } else {
-            result.as_ref()
-        };
-        if let Some(report) = report.filter(|s| s.error_count() > 0) {
-            println!("\n  Recent file errors");
-            for error in report.errors.iter().take(10) {
-                println!("    {error}");
-            }
-            let shown = report.errors.len().min(10) as u64;
-            if report.error_count() > shown {
-                println!(
-                    "    … {} more (use --errors for full details)",
-                    count(report.error_count() - shown)
-                );
-            }
+        for error in &report.errors {
+            println!("  {error}");
         }
     }
 
