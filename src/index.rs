@@ -272,105 +272,17 @@ impl Index {
         // Enough for the scan/apply working set without growing with file count.
         conn.set_prepared_statement_cache_capacity(64);
         conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA journal_size_limit=67108864;",
         )?;
-        crate::paths::functions(&conn)?;
-        conn.execute_batch("PRAGMA journal_size_limit=67108864;")?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(
-            (0..=6).contains(&version),
-            "unsupported index schema version {version}"
-        );
-        if version < 5 {
-            conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value BLOB NOT NULL);
-             CREATE TABLE IF NOT EXISTS files (
-               id INTEGER PRIMARY KEY AUTOINCREMENT, path BLOB NOT NULL UNIQUE,
-               dev INTEGER NOT NULL, ino INTEGER NOT NULL, fingerprint BLOB NOT NULL,
-               fskey BLOB NOT NULL, alignment INTEGER NOT NULL,
-               UNIQUE(dev, ino));
-             CREATE TABLE IF NOT EXISTS file_policies (
-               file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
-               policy INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS ranges (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-               kind INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL,
-               hash BLOB NOT NULL, pending INTEGER NOT NULL DEFAULT 1,
-               UNIQUE(file_id, kind, offset));
-             CREATE INDEX IF NOT EXISTS matches ON ranges(kind, hash, length, id);
-             CREATE INDEX IF NOT EXISTS pending ON ranges(kind, id) WHERE pending=1;
-             CREATE TABLE IF NOT EXISTS completed (
-               target INTEGER PRIMARY KEY REFERENCES ranges(id) ON DELETE CASCADE,
-               source INTEGER NOT NULL REFERENCES ranges(id) ON DELETE CASCADE);
-             CREATE INDEX IF NOT EXISTS completed_source ON completed(source);
-             CREATE TRIGGER IF NOT EXISTS invalidate_source BEFORE DELETE ON ranges BEGIN
-               UPDATE ranges SET pending=1 WHERE id IN
-                 (SELECT target FROM completed WHERE source=OLD.id);
-             END;
-             CREATE TRIGGER IF NOT EXISTS invalidate_summary_insert AFTER INSERT ON ranges BEGIN
-               DELETE FROM config WHERE key='summary';
-             END;
-             CREATE TRIGGER IF NOT EXISTS invalidate_summary_delete AFTER DELETE ON ranges BEGIN
-               DELETE FROM config WHERE key='summary';
-             END;
-             CREATE TRIGGER IF NOT EXISTS invalidate_summary_update AFTER UPDATE OF hash,length,kind ON ranges BEGIN
-               DELETE FROM config WHERE key='summary';
-             END;
-             CREATE TEMP TABLE seen (file_id INTEGER PRIMARY KEY);
+        crate::schema::migrate(&conn, 0)?;
+        conn.execute_batch(
+            "CREATE TEMP TABLE seen (file_id INTEGER PRIMARY KEY);
              CREATE TEMP TABLE apply_failed (id INTEGER PRIMARY KEY);
              CREATE TEMP TABLE apply_crawls (id INTEGER PRIMARY KEY);
              CREATE TEMP TABLE class_sources (
                kind INTEGER, hash BLOB, length INTEGER, fskey BLOB, policy INTEGER, source INTEGER,
                PRIMARY KEY(kind,hash,length,fskey,policy));",
         )?;
-        } else {
-            conn.execute_batch("CREATE TEMP TABLE seen(file_id INTEGER PRIMARY KEY);
-              CREATE TEMP TABLE apply_failed(id INTEGER PRIMARY KEY);
-              CREATE TEMP TABLE apply_crawls(id INTEGER PRIMARY KEY);
-              CREATE TEMP TABLE class_sources(kind INTEGER,hash BLOB,length INTEGER,fskey BLOB,policy INTEGER,source INTEGER,PRIMARY KEY(kind,hash,length,fskey,policy));")?;
-        }
-        if version < 2 {
-            conn.execute_batch(
-                "BEGIN IMMEDIATE;
-              CREATE TABLE chunk_cache (
-                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-                offset INTEGER NOT NULL, length INTEGER NOT NULL, hash BLOB NOT NULL,
-                nonzero INTEGER NOT NULL, PRIMARY KEY(file_id,offset));
-              CREATE TABLE extent_state (
-                file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
-                incarnation BLOB NOT NULL);
-              CREATE TABLE file_extents (
-                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-                offset INTEGER NOT NULL, length INTEGER NOT NULL, descriptor BLOB NOT NULL,
-                PRIMARY KEY(file_id,offset));
-              CREATE TABLE crawls (
-                id INTEGER PRIMARY KEY, identity BLOB NOT NULL UNIQUE, path BLOB NOT NULL,
-                completed INTEGER NOT NULL DEFAULT 0, low INTEGER, high INTEGER,
-                cursor BLOB, enumerated INTEGER NOT NULL DEFAULT 0,
-                initialized INTEGER NOT NULL DEFAULT 0);
-              CREATE TABLE discovery (
-                crawl_id INTEGER NOT NULL REFERENCES crawls(id) ON DELETE CASCADE,
-                ino INTEGER NOT NULL, directory INTEGER NOT NULL,
-                PRIMARY KEY(crawl_id,ino));
-              CREATE TABLE btrfs_files (
-                file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
-                crawl_id INTEGER NOT NULL REFERENCES crawls(id) ON DELETE CASCADE,
-                ino INTEGER NOT NULL, parent BLOB NOT NULL,
-                UNIQUE(crawl_id,ino));
-              CREATE INDEX btrfs_file_parent ON btrfs_files(crawl_id,parent);
-              CREATE TABLE btrfs_dirs (
-                crawl_id INTEGER NOT NULL REFERENCES crawls(id) ON DELETE CASCADE,
-                ino INTEGER NOT NULL, path BLOB NOT NULL, parent BLOB NOT NULL,
-                PRIMARY KEY(crawl_id,ino));
-              CREATE INDEX btrfs_dir_parent ON btrfs_dirs(crawl_id,parent);
-              CREATE TRIGGER invalidate_extent_baseline AFTER DELETE ON chunk_cache BEGIN
-                DELETE FROM extent_state WHERE file_id=OLD.file_id;
-              END;
-              PRAGMA user_version=2;
-              COMMIT;",
-            )?;
-        }
         // Configuration changes require a fresh index, never silent stale reuse.
         let config = serde_json::to_vec(&(
             options.chunk_size,
@@ -394,54 +306,6 @@ impl Index {
             );
         } else {
             conn.execute("INSERT INTO config VALUES ('scan', ?1)", [&config])?;
-        }
-        if version < 3 {
-            let tx = conn.unchecked_transaction()?;
-            let lengths = tx
-                .prepare("SELECT DISTINCT length FROM ranges WHERE kind=0 ORDER BY length")?
-                .query_map([], |r| r.get::<_, usize>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            // Migrate cached v1/v2 ranges without reading files. Incrementally
-            // hash prefixes of one zero buffer, so even many distinct EOF tail
-            // lengths require hashing at most one chunk's worth of zero bytes.
-            let maximum = lengths.last().copied().unwrap_or(0);
-            ensure!(
-                maximum <= options.chunk_size && maximum <= 16 * 1024 * 1024,
-                "invalid cached chunk length"
-            );
-            let zeros = vec![0; maximum];
-            let mut hasher = blake3::Hasher::new();
-            let mut previous = 0;
-            for length in lengths {
-                hasher.update(&zeros[previous..length]);
-                let hash = hasher.finalize();
-                tx.execute(
-                    "DELETE FROM ranges WHERE kind=0 AND length=?1 AND hash=?2",
-                    params![length, hash.as_bytes().as_slice()],
-                )?;
-                previous = length;
-            }
-            tx.pragma_update(None, "user_version", 3)?;
-            tx.commit()?;
-        }
-        // Directory reconciliation precedes file jobs. Without this index,
-        // finding each directory can walk all earlier queued regular files.
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS discovery_kind ON discovery(crawl_id,directory,ino);",
-        )?;
-        if version < 4 {
-            conn.execute_batch(
-                "BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS apply_mappings (
-                    file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE);
-                PRAGMA user_version=4; COMMIT;",
-            )?;
-        }
-        if version < 5 {
-            crate::paths::migrate(&conn)?;
-        }
-        if version < 6 {
-            crate::records::migrate(&conn)?;
         }
         crate::inventory_state::initialize(&conn)?;
         // A process or machine crash may have preserved SQLite's provisional

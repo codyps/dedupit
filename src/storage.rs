@@ -144,21 +144,10 @@ pub fn compact(database: &Path, storage: Storage) -> Result<()> {
         .try_lock_exclusive()
         .context("database inode is already in use")?;
     let conn = Connection::open(&database)?;
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    ensure!(
-        (4..=6).contains(&version),
-        "compact supports schema versions 4 through 6"
-    );
-    crate::paths::functions(&conn)?;
     conn.execute_batch(
         "PRAGMA synchronous=FULL; PRAGMA temp_store=FILE; PRAGMA cache_size=-16384;",
     )?;
-    if version < 5 {
-        crate::paths::migrate(&conn)?;
-    }
-    if version < 6 {
-        crate::records::migrate(&conn)?;
-    }
+    crate::schema::migrate(&conn, 4)?;
     let (busy, _, _): (i64, i64, i64) =
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))

@@ -372,10 +372,59 @@ fn legacy_paths(conn: &rusqlite::Connection) {
       INSERT INTO btrfs_files_old SELECT b.file_id,b.crawl_id,b.ino,p.path FROM btrfs_files b JOIN files f ON f.id=b.file_id JOIN path_parents p ON p.id=f.parent_id;
       CREATE TABLE btrfs_dirs_old(crawl_id INTEGER REFERENCES crawls(id) ON DELETE CASCADE,ino INTEGER,path BLOB,parent BLOB,PRIMARY KEY(crawl_id,ino));
       INSERT INTO btrfs_dirs_old SELECT b.crawl_id,b.ino,b.path,p.path FROM btrfs_dirs b JOIN path_parents p ON p.id=b.parent_id;
-      DROP VIEW file_paths; DROP TABLE btrfs_files; DROP TABLE btrfs_dirs; DROP TABLE files; DROP TABLE path_parents;
+      DROP TABLE file_policies; DROP VIEW file_paths; DROP TABLE btrfs_files; DROP TABLE btrfs_dirs; DROP TABLE files; DROP TABLE path_parents;
       ALTER TABLE files_old RENAME TO files; ALTER TABLE btrfs_files_old RENAME TO btrfs_files; ALTER TABLE btrfs_dirs_old RENAME TO btrfs_dirs;
       CREATE INDEX btrfs_file_parent ON btrfs_files(crawl_id,parent); CREATE INDEX btrfs_dir_parent ON btrfs_dirs(crawl_id,parent);
       COMMIT; PRAGMA foreign_keys=ON;").unwrap();
+}
+
+#[test]
+fn compaction_and_scanning_upgrade_indexes_missing_file_policies() {
+    for (version, compact) in [(4, true), (6, true), (6, false)] {
+        let (_dir, options) = setup(Granularity::Both);
+        put(&options, "a", &vec![1; 8192]);
+        put(&options, "b", &vec![1; 8192]);
+        let initial = run(&options, false).unwrap();
+        assert!(initial.duplicate_chunks > 0);
+
+        let conn = rusqlite::Connection::open(&options.database).unwrap();
+        if version == 4 {
+            legacy_paths(&conn);
+        } else {
+            conn.execute_batch("DROP TABLE file_policies;").unwrap();
+        }
+        conn.pragma_update(None, "user_version", version).unwrap();
+        drop(conn);
+
+        if compact {
+            dedupit::storage::compact(&options.database, options.storage).unwrap();
+            // Check before scanning so the scanner cannot hide a compaction bug.
+            let conn = rusqlite::Connection::open(&options.database).unwrap();
+            assert_policy_schema(&conn);
+        }
+        let resumed = run_with_backend(&options, true, &mut ComparingBackend::default()).unwrap();
+        assert_eq!(resumed.bytes_hashed, 0);
+        assert!(resumed.jobs_completed > 0);
+
+        let conn = rusqlite::Connection::open(&options.database).unwrap();
+        assert_policy_schema(&conn);
+    }
+}
+
+fn assert_policy_schema(conn: &rusqlite::Connection) {
+    assert_eq!(
+        conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
+    assert!(conn
+        .prepare("SELECT file_id, policy FROM file_policies")
+        .is_ok());
+    assert!(!conn
+        .prepare("PRAGMA foreign_key_check")
+        .unwrap()
+        .exists([])
+        .unwrap());
 }
 
 #[test]
@@ -397,7 +446,7 @@ fn version_three_upgrade_preserves_hashes_and_completed_jobs() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
             .unwrap(),
-        6
+        7
     );
 }
 
@@ -420,7 +469,7 @@ fn version_one_index_migrates_without_rehashing_portable_files() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
 }
 
@@ -480,7 +529,7 @@ fn old_zero_chunk_candidates_migrate_without_reading_files() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
 }
 

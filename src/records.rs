@@ -1,6 +1,6 @@
 //! Compact extent identities and one canonical record for each candidate chunk.
 use anyhow::{ensure, Result};
-use rusqlite::{functions::FunctionFlags, Connection};
+use rusqlite::{functions::FunctionFlags, Transaction};
 
 /// Input is a raw Btrfs file-extent item. Regular/preallocated records retain
 /// their kernel layout; inline items retain the header and a domain-separated
@@ -17,11 +17,11 @@ pub(crate) fn descriptor(raw: &[u8]) -> Vec<u8> {
     result
 }
 
-pub(crate) fn migrate(conn: &Connection) -> Result<()> {
+pub(crate) fn migrate(tx: &Transaction<'_>) -> Result<()> {
     eprintln!(
         "Consolidating chunk records and compacting inline descriptors; retaining scan progress"
     );
-    conn.create_scalar_function(
+    tx.create_scalar_function(
         "dedupit_extent_descriptor",
         1,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
@@ -30,7 +30,6 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             Ok(descriptor(&raw))
         },
     )?;
-    let tx = conn.unchecked_transaction()?;
     let inconsistent: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM chunk_cache c JOIN ranges r
            ON r.file_id=c.file_id AND r.kind=0 AND r.offset=c.offset
@@ -74,19 +73,17 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
              CASE WHEN substr(descriptor,21,1)=x'00' THEN dedupit_extent_descriptor(descriptor) ELSE descriptor END
            FROM file_extents;
          DROP TABLE file_extents;
-         ALTER TABLE file_extents_compact RENAME TO file_extents;
-         PRAGMA user_version=6;",
+         ALTER TABLE file_extents_compact RENAME TO file_extents;",
     )?;
     let bad: bool = tx.prepare("PRAGMA foreign_key_check")?.exists([])?;
     ensure!(!bad, "consolidation has foreign key violations");
-    tx.commit()?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::params;
+    use rusqlite::{params, Connection};
     fn inline(payload: &[u8]) -> Vec<u8> {
         let mut raw = vec![0; 21];
         raw[..8].copy_from_slice(&42u64.to_le_bytes());
@@ -145,7 +142,7 @@ mod tests {
     fn migration_reuses_candidate_rows_without_changing_jobs_or_baselines() {
         let c = Connection::open_in_memory().unwrap();
         let raw = legacy(&c);
-        migrate(&c).unwrap();
+        crate::schema::apply_step(&c, 6).unwrap();
         assert_eq!(
             c.query_row("SELECT COUNT(*) FROM chunk_cache_extra", [], |r| r
                 .get::<_, i64>(0))
@@ -235,7 +232,7 @@ mod tests {
         let raw = legacy(&c);
         c.execute_batch("CREATE TABLE file_extents_compact(block_migration INTEGER)")
             .unwrap();
-        assert!(migrate(&c).is_err());
+        assert!(crate::schema::apply_step(&c, 6).is_err());
         assert_eq!(
             c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
@@ -266,7 +263,7 @@ mod tests {
             3
         );
         c.execute_batch("DROP TABLE file_extents_compact").unwrap();
-        migrate(&c).unwrap();
+        crate::schema::apply_step(&c, 6).unwrap();
     }
     #[test]
     fn inconsistent_copies_abort_without_discarding_either_hash() {
@@ -277,7 +274,7 @@ mod tests {
             params![b"wrong".as_slice()],
         )
         .unwrap();
-        assert!(migrate(&c).is_err());
+        assert!(crate::schema::apply_step(&c, 6).is_err());
         assert_eq!(
             c.query_row("SELECT hex(hash) FROM ranges WHERE id=41", [], |r| r
                 .get::<_, String>(0))

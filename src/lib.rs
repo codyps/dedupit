@@ -20,6 +20,7 @@ mod records;
 #[cfg(target_os = "linux")]
 mod savings;
 mod scan;
+mod schema;
 pub mod storage;
 
 use anyhow::{ensure, Context, Result};

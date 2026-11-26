@@ -1,7 +1,7 @@
 //! Normalized, byte-preserving Unix paths. Migration retains all scan/job IDs.
 use crate::index::SqlCache;
 use anyhow::{ensure, Context, Result};
-use rusqlite::{functions::FunctionFlags, Connection};
+use rusqlite::{functions::FunctionFlags, Connection, Transaction};
 use std::{os::unix::ffi::OsStrExt, path::Path};
 
 fn split(path: &[u8]) -> (&[u8], &[u8]) {
@@ -44,60 +44,48 @@ pub(crate) fn intern<'a>(conn: &Connection, path: &'a Path) -> Result<(i64, &'a 
     Ok((directory_id(conn, parent)?, name))
 }
 
-pub(crate) fn migrate(conn: &Connection) -> Result<()> {
+pub(crate) fn migrate(tx: &Transaction<'_>) -> Result<()> {
     eprintln!("Migrating index paths; retaining hashes, file IDs, and scan cursors");
-    // SQLite's documented table-rebuild procedure: disable foreign keys outside
-    // the transaction and check every relationship before committing the swap.
-    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
-    let result = (|| -> Result<()> {
-        let tx = conn.unchecked_transaction()?;
-        tx.execute_batch(
-            "CREATE TABLE path_parents(id INTEGER PRIMARY KEY,path BLOB NOT NULL UNIQUE);
-             INSERT INTO path_parents(path) SELECT DISTINCT dedupit_parent(path) FROM files;
-             INSERT OR IGNORE INTO path_parents(path) SELECT DISTINCT parent FROM btrfs_dirs;
-             CREATE TABLE files_new (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               parent_id INTEGER NOT NULL REFERENCES path_parents(id), name BLOB NOT NULL,
-               dev INTEGER NOT NULL,ino INTEGER NOT NULL,fingerprint BLOB NOT NULL,
-               fskey BLOB NOT NULL,alignment INTEGER NOT NULL);
-             INSERT INTO files_new SELECT f.id,p.id,dedupit_name(f.path),f.dev,f.ino,f.fingerprint,f.fskey,f.alignment
-               FROM files f JOIN path_parents p ON p.path=dedupit_parent(f.path);
-             UPDATE sqlite_sequence SET seq=MAX(seq,COALESCE((SELECT seq FROM sqlite_sequence WHERE name='files'),0)) WHERE name='files_new';
-             CREATE UNIQUE INDEX file_name ON files_new(parent_id,name);
-             CREATE UNIQUE INDEX file_inode ON files_new(dev,ino);
-             CREATE TABLE btrfs_files_new (
-               file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
-               crawl_id INTEGER NOT NULL REFERENCES crawls(id) ON DELETE CASCADE,
-               ino INTEGER NOT NULL,UNIQUE(crawl_id,ino));
-             INSERT INTO btrfs_files_new SELECT file_id,crawl_id,ino FROM btrfs_files;
-             CREATE TABLE btrfs_dirs_new (
-               crawl_id INTEGER NOT NULL REFERENCES crawls(id) ON DELETE CASCADE,
-               ino INTEGER NOT NULL,path BLOB NOT NULL,
-               parent_id INTEGER NOT NULL REFERENCES path_parents(id),
-               PRIMARY KEY(crawl_id,ino)) WITHOUT ROWID;
-             INSERT INTO btrfs_dirs_new SELECT b.crawl_id,b.ino,b.path,p.id
-               FROM btrfs_dirs b JOIN path_parents p ON p.path=b.parent;
-             DROP TABLE btrfs_files;
-             DROP TABLE btrfs_dirs;
-             DROP TABLE files;
-             ALTER TABLE files_new RENAME TO files;
-             ALTER TABLE btrfs_files_new RENAME TO btrfs_files;
-             ALTER TABLE btrfs_dirs_new RENAME TO btrfs_dirs;
-             CREATE INDEX btrfs_dir_parent ON btrfs_dirs(crawl_id,parent_id);
-             CREATE VIEW file_paths AS SELECT f.*,CAST(p.path || CASE WHEN p.path=x'2f' THEN x'' ELSE x'2f' END || f.name AS BLOB) AS path
-               FROM files f JOIN path_parents p ON p.id=f.parent_id;
-             PRAGMA user_version=5;",
-        )?;
-        let violations: u64 =
-            tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
-                r.get(0)
-            })?;
-        ensure!(violations == 0, "path migration has foreign key violations");
-        tx.commit()?;
-        Ok(())
-    })();
-    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-    result
+    functions(tx)?;
+    tx.execute_batch(
+        "CREATE TABLE path_parents(id INTEGER PRIMARY KEY,path BLOB NOT NULL UNIQUE);
+         INSERT INTO path_parents(path) SELECT DISTINCT dedupit_parent(path) FROM files;
+         INSERT OR IGNORE INTO path_parents(path) SELECT DISTINCT parent FROM btrfs_dirs;
+         CREATE TABLE files_new (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           parent_id INTEGER NOT NULL REFERENCES path_parents(id), name BLOB NOT NULL,
+           dev INTEGER NOT NULL,ino INTEGER NOT NULL,fingerprint BLOB NOT NULL,
+           fskey BLOB NOT NULL,alignment INTEGER NOT NULL);
+         INSERT INTO files_new SELECT f.id,p.id,dedupit_name(f.path),f.dev,f.ino,f.fingerprint,f.fskey,f.alignment
+           FROM files f JOIN path_parents p ON p.path=dedupit_parent(f.path);
+         UPDATE sqlite_sequence SET seq=MAX(seq,COALESCE((SELECT seq FROM sqlite_sequence WHERE name='files'),0)) WHERE name='files_new';
+         CREATE UNIQUE INDEX file_name ON files_new(parent_id,name);
+         CREATE UNIQUE INDEX file_inode ON files_new(dev,ino);
+         CREATE TABLE btrfs_files_new (
+           file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+           crawl_id INTEGER NOT NULL REFERENCES crawls(id) ON DELETE CASCADE,
+           ino INTEGER NOT NULL,UNIQUE(crawl_id,ino));
+         INSERT INTO btrfs_files_new SELECT file_id,crawl_id,ino FROM btrfs_files;
+         CREATE TABLE btrfs_dirs_new (
+           crawl_id INTEGER NOT NULL REFERENCES crawls(id) ON DELETE CASCADE,
+           ino INTEGER NOT NULL,path BLOB NOT NULL,
+           parent_id INTEGER NOT NULL REFERENCES path_parents(id),
+           PRIMARY KEY(crawl_id,ino)) WITHOUT ROWID;
+         INSERT INTO btrfs_dirs_new SELECT b.crawl_id,b.ino,b.path,p.id
+           FROM btrfs_dirs b JOIN path_parents p ON p.path=b.parent;
+         DROP TABLE btrfs_files;
+         DROP TABLE btrfs_dirs;
+         DROP TABLE files;
+         ALTER TABLE files_new RENAME TO files;
+         ALTER TABLE btrfs_files_new RENAME TO btrfs_files;
+         ALTER TABLE btrfs_dirs_new RENAME TO btrfs_dirs;
+         CREATE INDEX btrfs_dir_parent ON btrfs_dirs(crawl_id,parent_id);
+         CREATE VIEW file_paths AS SELECT f.*,CAST(p.path || CASE WHEN p.path=x'2f' THEN x'' ELSE x'2f' END || f.name AS BLOB) AS path
+           FROM files f JOIN path_parents p ON p.id=f.parent_id;",
+    )?;
+    let bad = tx.prepare("PRAGMA foreign_key_check")?.exists([])?;
+    ensure!(!bad, "path migration has foreign key violations");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -177,7 +165,7 @@ mod migration_tests {
     fn migration_preserves_ids_hashes_jobs_cursors_and_non_utf8_paths() {
         let c = Connection::open_in_memory().unwrap();
         legacy(&c);
-        migrate(&c).unwrap();
+        crate::schema::apply_step(&c, 5).unwrap();
         let paths: Vec<(i64, Vec<u8>)> = c
             .prepare("SELECT id,path FROM file_paths ORDER BY id")
             .unwrap()
@@ -257,7 +245,7 @@ mod migration_tests {
         legacy(&c);
         c.execute_batch("CREATE TABLE files_new(block_migration INTEGER)")
             .unwrap();
-        assert!(migrate(&c).is_err());
+        assert!(crate::schema::apply_step(&c, 5).is_err());
         assert_eq!(
             c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
@@ -282,6 +270,6 @@ mod migration_tests {
             1
         );
         c.execute_batch("DROP TABLE files_new").unwrap();
-        migrate(&c).unwrap();
+        crate::schema::apply_step(&c, 5).unwrap();
     }
 }
