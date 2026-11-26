@@ -61,6 +61,23 @@ sudo dedupit stats --json
 sudo dedupit stats --errors
 ```
 
+List saved scans and use a run ID from the list to read its report or errors.
+
+```sh
+sudo dedupit stats --runs
+sudo dedupit stats --run 42
+sudo dedupit stats --run 42 --errors
+sudo dedupit stats --run 42 --json
+```
+
+On NixOS with the `sys` wrapper, use `sudo sys dedupit-stats` with the same flags.
+The service saves a compact report and an error log for each scan in
+`STATE_DIRECTORY/runs`. Failed, paused, and interrupted runs remain in the list.
+On first startup the last completed report from an older Dedupit version is
+preserved as run 0. Other pre-upgrade runs are available only where their logs
+were independently retained. History has no automatic expiration; detailed
+error logs can grow substantially.
+
 Defaults are `/var/lib/dedupit` for state, 1 MiB chunks, and a 3,600-second wait
 between runs. The service pauses below 5 GiB available on the **state-directory
 filesystem**, checked before opening the index and every 30 seconds during work.

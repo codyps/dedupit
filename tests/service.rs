@@ -124,6 +124,112 @@ fn service_repeats_records_statistics_and_resumes_index_and_totals_after_sigterm
     restarted.stop();
 }
 
+fn history_stats(state: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_dedupit"))
+        .args(["stats", "--state-directory"])
+        .arg(state)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn history_json(state: &Path, args: &[&str]) -> Value {
+    let output = history_stats(state, args);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn history_preserves_the_legacy_result_and_new_run_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let data = dir.path().join("data");
+    fs::create_dir(&data).unwrap();
+    fs::create_dir(&state).unwrap();
+    fs::write(data.join("file"), b"new file").unwrap();
+    fs::write(
+        state.join("filesystem-result.json"),
+        r#"{"files_seen":77,"errors":["old error one","old error two"]}"#,
+    )
+    .unwrap();
+
+    let mut daemon = launch(&state, &data, "0", "3600");
+    wait_status(&state, |s| s["state"] == "completed");
+    daemon.stop();
+
+    let runs = history_json(&state, &["--runs", "--json"]);
+    let runs = runs.as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["run_id"], 1);
+    assert_eq!(runs[0]["state"], "completed");
+    assert_eq!(runs[1]["run_id"], 0);
+    assert_eq!(runs[1]["state"], "finished_with_errors");
+    assert!(runs[1]["started_at"].is_null());
+    let listing = history_stats(&state, &["--runs"]);
+    assert!(listing.status.success());
+    assert!(String::from_utf8(listing.stdout)
+        .unwrap()
+        .contains("Completed with file errors"));
+
+    let legacy = history_json(&state, &["--run", "0", "--json"]);
+    assert_eq!(legacy["progress"]["files_seen"], 77);
+    let report = history_stats(&state, &["--run", "0", "--errors"]);
+    assert!(report.status.success());
+    let text = String::from_utf8(report.stdout).unwrap();
+    assert!(text.contains("File errors from run 0"));
+    assert!(text.contains("old error one"));
+    assert!(text.contains("old error two"));
+    assert!(!history_stats(&state, &["--run", "99"]).status.success());
+}
+
+#[test]
+fn history_recovers_an_abandoned_run_and_keeps_its_error_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let data = dir.path().join("data");
+    let abandoned = state.join("runs/41");
+    fs::create_dir(&data).unwrap();
+    fs::create_dir_all(&abandoned).unwrap();
+    fs::write(
+        state.join("filesystem-status.json"),
+        r#"{"run_id":41,"state":"running","started_at":10,"updated_at":11,
+        "progress":{"errors":["previous error"],"errors_total":2}}"#,
+    )
+    .unwrap();
+    let old_log = abandoned.join("errors.jsonl");
+    fs::write(
+        &old_log,
+        b"\"previous error\"\n\"previous detail\"\n\"partial",
+    )
+    .unwrap();
+    fs::hard_link(&old_log, state.join("filesystem-errors.jsonl")).unwrap();
+
+    let mut daemon = launch(&state, &data, "18446744073709551615", "3600");
+    wait_status(&state, |s| s["state"] == "paused_for_space");
+    daemon.stop();
+
+    let runs = history_json(&state, &["--runs", "--json"]);
+    assert_eq!(runs[0]["run_id"], 42);
+    assert_eq!(runs[0]["state"], "paused_for_space");
+    assert_eq!(runs[1]["run_id"], 41);
+    assert_eq!(runs[1]["state"], "interrupted");
+    assert!(runs[1]["finished_at"].is_null());
+    let errors = history_stats(&state, &["--run", "41", "--errors"]);
+    assert!(errors.status.success());
+    let errors = String::from_utf8(errors.stdout).unwrap();
+    assert!(errors.contains("previous detail"));
+    assert!(!errors.contains("partial"));
+    let current = history_stats(&state, &["--run", "42", "--errors"]);
+    assert!(current.status.success());
+    assert!(!String::from_utf8(current.stdout)
+        .unwrap()
+        .contains("previous detail"));
+}
+
 #[test]
 fn service_pauses_before_opening_index_preserves_report_and_enforces_single_owner() {
     let dir = tempfile::tempdir().unwrap();

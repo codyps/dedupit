@@ -1,4 +1,5 @@
 //! Native foreground service: one scanning process, durable reports, no helpers.
+use crate::history;
 use anyhow::{bail, ensure, Context, Result};
 use dedupit::{Granularity, Options, RunObserver, Scanner, Stats};
 use fs2::FileExt;
@@ -7,7 +8,7 @@ use std::{
     cell::{Cell, RefCell},
     ffi::CString,
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, BufWriter, Write},
+    io::{self, BufReader, BufWriter, Write},
     os::unix::{
         ffi::OsStrExt,
         fs::{DirBuilderExt, OpenOptionsExt},
@@ -63,6 +64,12 @@ pub struct StatsArgs {
     state_directory: PathBuf,
     #[arg(long)]
     json: bool,
+    /// List saved scans, newest first.
+    #[arg(long, conflicts_with_all = ["run", "errors"])]
+    runs: bool,
+    /// Show the report for a run ID from --runs.
+    #[arg(long)]
+    run: Option<u64>,
     /// Stream full file-error details instead of the bounded preview.
     #[arg(long, conflicts_with = "json")]
     errors: bool,
@@ -178,6 +185,7 @@ fn recover_activity(previous: Option<&serde_json::Value>) -> Result<Activity> {
 
 #[derive(Serialize)]
 struct Status {
+    run_id: Option<u64>,
     state: &'static str,
     pid: u32,
     started_at: u64,
@@ -224,7 +232,7 @@ pub(super) fn save(path: &Path, value: &impl Serialize) -> Result<()> {
     result.with_context(|| format!("save {}", path.display()))
 }
 
-fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+pub(crate) fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     match File::open(path) {
         Ok(file) => Ok(Some(
             serde_json::from_reader(BufReader::with_capacity(64 * 1024, file))
@@ -534,7 +542,6 @@ pub fn run(args: ServiceArgs) -> Result<()> {
             fs::hard_link(directory.join("filesystem-status.json"), archive)?;
         }
     }
-    drop(previous);
     if !directory.join("filesystem-result-summary.json").exists() {
         if let Some(result) = read_optional::<Stats>(&directory.join("filesystem-result.json"))? {
             save(
@@ -543,10 +550,14 @@ pub fn run(args: ServiceArgs) -> Result<()> {
             )?;
         }
     }
+    history::recover(&directory, previous.as_ref())?;
+    let mut run_id = history::latest_id(&directory)?;
+    drop(previous);
     let monitor = Rc::new(Monitor {
         directory,
         minimum: args.minimum_free_bytes,
         status: RefCell::new(Status {
+            run_id: None,
             state: "starting",
             pid: std::process::id(),
             started_at: now(),
@@ -566,22 +577,12 @@ pub fn run(args: ServiceArgs) -> Result<()> {
         logged_errors: Cell::new(0),
     });
     while !STOP.load(Ordering::Relaxed) {
-        let error_log = monitor.directory.join("filesystem-errors.jsonl");
-        if error_log.exists() {
-            fs::rename(
-                &error_log,
-                monitor.directory.join("filesystem-errors-previous.jsonl"),
-            )?;
-        }
-        OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&error_log)?;
+        run_id = run_id.checked_add(1).context("run ID exhausted")?;
+        history::begin(&monitor.directory, run_id)?;
         monitor.logged_errors.set(0);
         {
             let mut status = monitor.status.borrow_mut();
+            status.run_id = Some(run_id);
             status.state = "running";
             status.activity.scans_started += 1;
             status.phase = "Checking free space";
@@ -653,7 +654,10 @@ pub fn run(args: ServiceArgs) -> Result<()> {
                     .unwrap_or_default()
             );
         }
+        // Publish the status and its cumulative counters before archiving.
+        // Startup can recover a missing archive from that same snapshot.
         monitor.write()?;
+        history::finish(&monitor.directory, run_id, &*monitor.status.borrow())?;
         // Idle inventories can finish even when the scan itself was brief.
         // Stop them before the next index opens raw SQLite/WAL guard handles.
         if !STOP.load(Ordering::Relaxed)
@@ -805,6 +809,12 @@ fn print_sharing_inventory(inventory: Option<&crate::inventory::Report>) {
 }
 
 pub fn stats(args: StatsArgs) -> Result<()> {
+    if args.runs {
+        return history::list(&args.state_directory, args.json);
+    }
+    if let Some(id) = args.run {
+        return history::show(&args.state_directory, id, args.json, args.errors);
+    }
     let status =
         read_optional::<serde_json::Value>(&args.state_directory.join("filesystem-status.json"))?;
     let result =
@@ -855,6 +865,9 @@ pub fn stats(args: StatsArgs) -> Result<()> {
             _ => "Unknown",
         };
         println!("  Status       {state}");
+        if let Some(id) = status["run_id"].as_u64() {
+            println!("  Run          {id}");
+        }
         if status["state"] == "running" {
             if let Some(phase) = status["phase"].as_str() {
                 println!("  Phase        {phase}");
@@ -1043,13 +1056,15 @@ pub fn stats(args: StatsArgs) -> Result<()> {
             );
         }
     } else if current_errors {
-        match File::open(args.state_directory.join("filesystem-errors.jsonl")) {
+        let log = status
+            .as_ref()
+            .and_then(|status| status["run_id"].as_u64())
+            .map(|id| history::error_log(&args.state_directory, id))
+            .unwrap_or_else(|| args.state_directory.join("filesystem-errors.jsonl"));
+        match File::open(log) {
             Ok(file) => {
                 let mut output = BufWriter::new(io::stdout().lock());
-                for line in BufReader::with_capacity(64 * 1024, file).lines() {
-                    let error: String = serde_json::from_str(&line?)?;
-                    writeln!(output, "  {error}")?;
-                }
+                history::write_error_log(file, &mut output)?;
                 output.flush()?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1068,7 +1083,7 @@ pub fn stats(args: StatsArgs) -> Result<()> {
     Ok(())
 }
 
-fn count(value: u64) -> String {
+pub(crate) fn count(value: u64) -> String {
     let digits = value.to_string();
     let mut formatted = String::new();
     for (i, digit) in digits.chars().enumerate() {
@@ -1080,7 +1095,7 @@ fn count(value: u64) -> String {
     formatted
 }
 
-fn size(bytes: u64) -> String {
+pub(crate) fn size(bytes: u64) -> String {
     const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     if bytes < 1024 {
         return format!("{bytes} B");
@@ -1165,6 +1180,7 @@ mod progress_tests {
 #[cfg(test)]
 mod summary_io_tests {
     use super::*;
+    use std::io::BufRead;
     #[test]
     fn live_summary_stays_small_and_full_error_log_is_incremental() {
         let directory = tempfile::tempdir().unwrap();
@@ -1172,6 +1188,7 @@ mod summary_io_tests {
             directory: directory.path().to_owned(),
             minimum: 0,
             status: RefCell::new(Status {
+                run_id: None,
                 state: "running",
                 pid: 1,
                 started_at: 0,

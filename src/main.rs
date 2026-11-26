@@ -1,3 +1,4 @@
+mod history;
 mod inventory;
 mod service;
 
