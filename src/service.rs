@@ -792,7 +792,7 @@ fn print_sharing_inventory(inventory: Option<&crate::inventory::Report>) {
     }
     if refresh.incremental {
         println!(
-            "  File updates to process            {} (includes removals)",
+            "  Files to check for sharing         {}",
             count(refresh.pending_files)
         );
         println!(
@@ -800,7 +800,7 @@ fn print_sharing_inventory(inventory: Option<&crate::inventory::Report>) {
             count(refresh.pending_groups)
         );
         if !refresh.bootstrap_complete {
-            println!("  The first check of indexed files is still in progress.");
+            println!("  Checking files already in the index.");
         }
     }
     if let Some(error) = &inventory.error {
@@ -947,6 +947,19 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         progress.as_ref().map(|s| s.bytes_deduped),
         result.as_ref().map(|s| s.bytes_deduped),
         Some(activity.bytes_deduped),
+        true,
+    );
+    row(
+        "Disk bytes freed (est.)",
+        progress
+            .as_ref()
+            .filter(|s| s.savings_measured_bytes > 0)
+            .map(|s| s.estimated_bytes_saved),
+        result
+            .as_ref()
+            .filter(|s| s.savings_measured_bytes > 0)
+            .map(|s| s.estimated_bytes_saved),
+        (activity.savings_measured_bytes > 0).then_some(activity.estimated_bytes_saved),
         true,
     );
     row(

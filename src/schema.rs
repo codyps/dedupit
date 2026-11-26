@@ -13,6 +13,7 @@ const MIGRATIONS: &[Migration] = &[
     crate::paths::migrate,
     crate::records::migrate,
     complete_legacy_schema,
+    crate::inventory_state::repair_file_queue,
 ];
 const PATHS_VERSION: usize = 5;
 

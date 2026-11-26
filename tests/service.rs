@@ -380,7 +380,7 @@ fn stats_pairs_savings_with_measured_files_and_shows_newer_queues() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(
         directory.path().join("filesystem-status.json"),
-        r#"{"state":"running","progress":{"bytes_deduped":1024}}"#,
+        r#"{"state":"running","progress":{"bytes_deduped":1024,"estimated_bytes_saved":512,"savings_measured_bytes":1024}}"#,
     )
     .unwrap();
     let inventory = serde_json::json!({
@@ -426,10 +426,11 @@ fn stats_pairs_savings_with_measured_files_and_shows_newer_queues() {
         "Sharing measured for 658 of the 1,000 files in the index.",
         "Combined file size is 8.00 KiB.",
         "Files and directories to scan 765",
-        "File updates to process 321 (includes removals)",
+        "Files to check for sharing 321",
         "Disk allocations to recalculate 12",
-        "The first check of indexed files is still in progress.",
+        "Checking files already in the index.",
         "Logical bytes shared 1.00 KiB",
+        "Disk bytes freed (est.) 512 B",
     ] {
         assert!(
             normalized.contains(expected),

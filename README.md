@@ -102,11 +102,12 @@ including on systems with ephemeral roots.
   contributed to the estimate. Dedupit measures sharing using Btrfs extent
   mappings it has checked against current files. The index can contain other
   files, and the total number of files on the volume is unknown.
-- **Queued work** shows scan entries for files and directories, file updates
-  (including removals), and disk allocations whose sharing totals need updating.
+- **Queued work** shows scan entries for files and directories, indexed files
+  awaiting a sharing check, and allocations whose sharing totals need updating.
   The counts can overlap and grow as more files are found.
 - **Scan activity** counts operations. Logical bytes shared may include
-  repeated work across scans.
+  repeated work across scans. Disk bytes freed estimates space released by
+  measured operations that replaced the last reference to an allocation.
 
 ## NixOS
 

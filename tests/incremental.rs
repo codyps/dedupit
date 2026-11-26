@@ -391,7 +391,17 @@ fn compaction_and_scanning_upgrade_indexes_missing_file_policies() {
         if version == 4 {
             legacy_paths(&conn);
         } else {
-            conn.execute_batch("DROP TABLE file_policies;").unwrap();
+            conn.execute_batch(
+                "DROP TABLE file_policies;
+                 DROP TRIGGER inventory_invalidate_group;
+                 DROP TRIGGER inventory_queue_old_groups;
+                 DROP TRIGGER inventory_count_dirty_group_delete;
+                 ALTER TABLE inventory_progress DROP COLUMN dirty_groups;
+                 DROP TRIGGER inventory_count_dirty_insert;
+                 DROP TRIGGER inventory_count_dirty_delete;
+                 ALTER TABLE inventory_progress DROP COLUMN dirty_files;",
+            )
+            .unwrap();
         }
         conn.pragma_update(None, "user_version", version).unwrap();
         drop(conn);
@@ -415,7 +425,7 @@ fn assert_policy_schema(conn: &rusqlite::Connection) {
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
     assert!(conn
         .prepare("SELECT file_id, policy FROM file_policies")
@@ -446,7 +456,7 @@ fn version_three_upgrade_preserves_hashes_and_completed_jobs() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
             .unwrap(),
-        7
+        8
     );
 }
 
@@ -469,7 +479,7 @@ fn version_one_index_migrates_without_rehashing_portable_files() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
 }
 
@@ -529,7 +539,7 @@ fn old_zero_chunk_candidates_migrate_without_reading_files() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
 }
 

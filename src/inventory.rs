@@ -391,11 +391,11 @@ fn file_batch_with(
                     inline.saturating_mul(links - 1)
                 ],
             )?;
-            tx.execute_cached("INSERT OR IGNORE INTO inventory_dirty_groups SELECT f.fskey,substr(e.descriptor,22,8) FROM file_extents e JOIN files f ON f.id=e.file_id WHERE e.file_id=?1 AND substr(e.descriptor,21,1)=x'01'", [id])?;
+            tx.execute_cached("INSERT INTO inventory_dirty_groups SELECT f.fskey,substr(e.descriptor,22,8) FROM file_extents e JOIN files f ON f.id=e.file_id WHERE e.file_id=?1 AND substr(e.descriptor,21,1)=x'01' ON CONFLICT(fskey,physical) DO NOTHING", [id])?;
             checked_bytes += metadata.len();
         }
         if candidate.metadata.is_none() && !candidate.fingerprint.is_empty() {
-            tx.execute_cached("INSERT INTO inventory_dirty(file_id,revision,retry_after) VALUES(?1,1,unixepoch()+30) ON CONFLICT(file_id) DO UPDATE SET retry_after=unixepoch()+30",[id])?;
+            tx.execute_cached("INSERT INTO inventory_dirty(file_id,revision,retry_after) SELECT id,1,unixepoch()+30 FROM files WHERE id=?1 ON CONFLICT(file_id) DO UPDATE SET retry_after=unixepoch()+30",[id])?;
             continue;
         }
         tx.execute_cached(
@@ -545,12 +545,19 @@ fn refresh(
         let groups = group_batch(&mut connection, stop)?;
         worked |= files > 0 || groups > 0;
         if last_report.elapsed() >= Duration::from_secs(2) || (files == 0 && groups == 0) {
-            let (cursor,ceiling,checked,bytes,indexed,pending):(u64,u64,u64,u64,u64,u64)=connection.query_row_cached(
-                "SELECT cursor,ceiling,checked,checked_bytes,indexed,pending FROM inventory_progress WHERE id=1",[],
-                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
-            let totals: (u64,u64,u64,u64,u64,u64,u64)=connection.query_row_cached(
-                "SELECT files,bytes,mapped,referenced,saved,physical_saved,covered FROM inventory_totals WHERE id=1",[],
-                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
+            let snapshot = connection.transaction()?;
+            let (cursor, ceiling, checked, bytes, indexed, pending, dirty_files, pending_groups) =
+                snapshot.query_row_cached(
+                    "SELECT cursor,ceiling,checked,checked_bytes,indexed,pending,dirty_files,dirty_groups FROM inventory_progress WHERE id=1",
+                    [],
+                    |r| Ok((r.get::<_, u64>(0)?, r.get::<_, u64>(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+                )?;
+            let totals: (u64, u64, u64, u64, u64, u64, u64) = snapshot.query_row_cached(
+                "SELECT files,bytes,mapped,referenced,saved,physical_saved,covered FROM inventory_totals WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )?;
+            snapshot.commit()?;
             report.refresh = Estimate {
                 as_of: crate::service::now(),
                 indexed_files: indexed,
@@ -568,16 +575,8 @@ fn refresh(
                 bootstrap_complete: cursor >= ceiling,
                 changed_files: checked,
                 changed_file_bytes: bytes,
-                pending_files: connection.query_row_cached(
-                    "SELECT count(*) FROM inventory_dirty",
-                    [],
-                    |r| r.get(0),
-                )?,
-                pending_groups: connection.query_row_cached(
-                    "SELECT count(*) FROM inventory_dirty_groups",
-                    [],
-                    |r| r.get(0),
-                )?,
+                pending_files: dirty_files,
+                pending_groups,
                 ..Default::default()
             };
             report.state = if cursor < ceiling {
@@ -586,11 +585,7 @@ fn refresh(
                 "Updating changed files and allocations"
             }
             .into();
-            // During bootstrap retain the previous full estimate until coverage
-            // catches up; progress is durable even when interrupted.
-            if cursor >= ceiling {
-                report.estimate = Some(report.refresh.clone());
-            }
+            report.estimate = (totals.0 > 0).then(|| report.refresh.clone());
             write(directory, report)?;
             last_report = Instant::now();
         }
