@@ -723,7 +723,7 @@ fn database_size(directory: &Path) -> Result<Option<DatabaseSize>> {
 }
 
 fn print_sharing_inventory(inventory: Option<&crate::inventory::Report>) {
-    println!("\nSpace saved across measured files");
+    println!("\nSavings from filesystem sharing");
     let Some(inventory) = inventory else {
         println!("  Waiting for the first sharing measurement.");
         return;
@@ -745,7 +745,7 @@ fn print_sharing_inventory(inventory: Option<&crate::inventory::Report>) {
         println!("  On disk (estimated)                {physical}");
         if estimate.physical_covered_bytes > 0 && estimate.referenced_data_bytes > 0 {
             println!(
-                "    Calculated from {} out of {} referenced by these files.",
+                "    Based on {} of {} referenced by the measured files.",
                 size(estimate.physical_covered_bytes),
                 size(estimate.referenced_data_bytes)
             );
@@ -754,23 +754,29 @@ fn print_sharing_inventory(inventory: Option<&crate::inventory::Report>) {
             "  Before compression                 {}",
             size(estimate.saved_uncompressed_bytes)
         );
+        let coverage = if estimate.indexed_files > 0 {
+            format!(
+                " ({:.1}%)",
+                100.0 * estimate.verified_files as f64 / estimate.indexed_files as f64
+            )
+        } else {
+            String::new()
+        };
+        println!(
+            "  Files measured                     {} of {} indexed{coverage}",
+            count(estimate.verified_files),
+            count(estimate.indexed_files)
+        );
+        println!(
+            "  Measured file sizes                {}",
+            size(estimate.checked_file_bytes)
+        );
         if estimate.as_of > 0 {
             println!(
                 "  Measured                           {} ago",
                 elapsed(current_time.saturating_sub(estimate.as_of))
             );
         }
-
-        println!("\nFiles measured");
-        println!(
-            "  Sharing measured for {} of the {} files in the index.",
-            count(estimate.verified_files),
-            count(estimate.indexed_files)
-        );
-        println!(
-            "  Combined file size is {}.",
-            size(estimate.checked_file_bytes)
-        );
     } else {
         println!("  Waiting for the first sharing measurement.");
     }
@@ -903,10 +909,10 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         println!("  Database     Not created yet");
     }
     print_sharing_inventory(inventory.as_ref());
-    println!("\nScan activity (operation counts)");
+    println!("\nDedupit scan activity");
     println!();
     println!(
-        "  {:<22} {:>17} {:>17} {:>17}",
+        "  {:<25} {:>17} {:>17} {:>17}",
         "", "Latest scan", "Last complete", "Recorded work"
     );
     let row = |label: &str, a: Option<u64>, b: Option<u64>, c: Option<u64>, bytes: bool| {
@@ -915,7 +921,7 @@ pub fn stats(args: StatsArgs) -> Result<()> {
                 .unwrap_or_else(|| "-".into())
         };
         println!(
-            "  {label:<22} {:>17} {:>17} {:>17}",
+            "  {label:<25} {:>17} {:>17} {:>17}",
             value(a),
             value(b),
             value(c)
@@ -950,7 +956,7 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         true,
     );
     row(
-        "Disk bytes freed (est.)",
+        "Disk space freed (est.)",
         progress
             .as_ref()
             .filter(|s| s.savings_measured_bytes > 0)
@@ -963,7 +969,7 @@ pub fn stats(args: StatsArgs) -> Result<()> {
         true,
     );
     row(
-        "Already shared",
+        "Found already shared",
         progress.as_ref().map(|s| s.bytes_already_shared),
         result.as_ref().map(|s| s.bytes_already_shared),
         Some(activity.bytes_already_shared),

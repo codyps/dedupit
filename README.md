@@ -94,20 +94,18 @@ Normal stats read small snapshots; `--errors` streams detailed error logs.
 Only one service can own a state directory. Preserve it across reboots,
 including on systems with ephemeral roots.
 
-- **Space saved across measured files** includes existing reflinks, snapshots,
-  and sharing by other tools. The on-disk estimate accounts for compression
-  within the amount of referenced data shown under it. Metadata and RAID overhead
-  are outside its scope.
-- **Files measured** gives the number and combined file sizes of files that
-  contributed to the estimate. Dedupit measures sharing using Btrfs extent
-  mappings it has checked against current files. The index can contain other
-  files, and the total number of files on the volume is unknown.
+- **Savings from filesystem sharing** estimates the space saved among the
+  measured files. It includes sharing created by Dedupit, snapshots, reflinks,
+  and other tools. The on-disk estimate accounts for compression where
+  allocation sizes can be estimated. It excludes metadata and RAID overhead. The file
+  count and percentage show how much of the current index was measured.
 - **Queued work** shows scan entries for files and directories, indexed files
   awaiting a sharing check, and allocations whose sharing totals need updating.
   The counts can overlap and grow as more files are found.
-- **Scan activity** counts operations. Logical bytes shared may include
-  repeated work across scans. Disk bytes freed estimates space released by
-  measured operations that replaced the last reference to an allocation.
+- **Dedupit scan activity** counts operations performed by the scanner.
+  Logical bytes shared is an operation counter that can include repeated
+  work across scans. Disk space freed estimates space released by measured
+  operations that replaced the last reference to an allocation.
 
 ## NixOS
 

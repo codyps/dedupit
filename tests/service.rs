@@ -421,16 +421,18 @@ fn stats_pairs_savings_with_measured_files_and_shows_newer_queues() {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     for expected in [
         "On disk (estimated) 2.00 KiB",
-        "Calculated from 4.00 KiB out of 8.00 KiB referenced by these files.",
+        "Savings from filesystem sharing",
+        "Based on 4.00 KiB of 8.00 KiB referenced by the measured files.",
         "Before compression 4.00 KiB",
-        "Sharing measured for 658 of the 1,000 files in the index.",
-        "Combined file size is 8.00 KiB.",
+        "Files measured 658 of 1,000 indexed (65.8%)",
+        "Measured file sizes 8.00 KiB",
         "Files and directories to scan 765",
         "Files to check for sharing 321",
         "Disk allocations to recalculate 12",
         "Checking files already in the index.",
         "Logical bytes shared 1.00 KiB",
-        "Disk bytes freed (est.) 512 B",
+        "Dedupit scan activity",
+        "Disk space freed (est.) 512 B",
     ] {
         assert!(
             normalized.contains(expected),

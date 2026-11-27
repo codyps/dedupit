@@ -266,9 +266,15 @@ pub(crate) fn show(directory: &Path, id: u64, json: bool, errors: bool) -> Resul
     println!("  Files scanned           {}", count(stats.files_seen));
     println!("  Files hashed            {}", count(stats.files_hashed));
     println!("  Data read               {}", size(stats.bytes_hashed));
-    println!("  Logical bytes shared    {}", size(stats.bytes_deduped));
+    println!("  Logical bytes shared     {}", size(stats.bytes_deduped));
+    if stats.savings_measured_bytes > 0 {
+        println!(
+            "  Disk space freed (est.)  {}",
+            size(stats.estimated_bytes_saved)
+        );
+    }
     println!(
-        "  Already shared          {}",
+        "  Found already shared     {}",
         size(stats.bytes_already_shared)
     );
     println!(
